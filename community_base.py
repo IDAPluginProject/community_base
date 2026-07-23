@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 r''' This text is easier to read when the markdown is parsed: <https://github.com/Harding-Stardust/community_base/blob/main/README.md>
 
 # Summary
@@ -73,7 +70,10 @@ Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-33-idas-user-directo
 - Need help with more testing
 - More of everything :-D
 '''
-__version__ = "2026-07-16 03:01:01"
+
+from __future__ import annotations
+
+__version__ = "2026-07-23 16:31:01"
 __author__ = "Harding"
 __description__ = __doc__
 __copyright__ = "Copyright 2026"
@@ -179,7 +179,7 @@ _G_DEFAULT_TIME_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _send_text_to_jupyter(arg_text: str) -> None:
-    ''' Send text directly to the IPyIDA/Jupyter frontend with colors preserved.
+    ''' Send text directly to the Jupyter frontend with colors preserved.
         Writes directly to the Jupyter kernel's iopub socket, bypassing IDA's stdout.
         @param arg_text: text to send to the Jupyter frontend
         @return: None
@@ -347,7 +347,7 @@ class DualOutputHandler(_logging.Handler):
             ANSI escapes are removed. IDA output always receives stripped text.
 
             @param arg_record: the logging.LogRecord to emit
-
+            
             @return: None
         '''
         try:
@@ -589,7 +589,7 @@ def bug_report(arg_bug_description: str, arg_module_to_blame: Union[str, ModuleT
     @param arg_module_to_blame The name of the module that is buggy, usually it's the plugin name or "IDA Pro"
 
     @return The full path to the bug report '''
-
+    
     # TODO: Add all running plugins and maybe all loaded python modules that are not standard?
     l_timestamp_for_filename: str = _time.strftime(_G_DEFAULT_TIME_FORMAT.replace('-','_').replace(' ','_').replace(':','_').replace('/','_'), _datetime.timetuple(_datetime.now()))
     l_bug_report_file: str = f"{input_file.idb_path}.{l_timestamp_for_filename}.bug_report.json"
@@ -758,11 +758,11 @@ def ida_save_database(arg_new_filename: str = "",
     l_my_extension = _os.path.splitext(input_file.idb_path)[1] # IDA 8.4 can have IDB, otherwise its always I64
     if l_new_filename and not l_new_filename.endswith(l_my_extension):
         l_new_filename += l_my_extension
-
-    if ida_version() >= 930:
+    
+    if ida_version() >= 930: 
         if arg_database_flags == -1: # IDA 9.3 have changed the default database flags
             arg_database_flags = 0
-
+        
         return _ida_loader.save_database(l_new_filename, arg_database_flags, arg_snapshot_root, arg_snapshot_attribute)
     return _ida_loader.save_database(l_new_filename, _ida_idaapi.as_uint32(arg_database_flags), arg_snapshot_root, arg_snapshot_attribute) # IDA 8.4 does not have keyword parameters
 
@@ -1140,15 +1140,15 @@ def _lnot(arg_expression: _ida_hexrays.cexpr_t) -> _ida_hexrays.cexpr_t:
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _idaapi_request_refresh(arg_mask: int = _ida_kernwin.IWID_ALL, arg_dirty: bool = True) -> None:
-    ''' Wrapper around ida_kernwin.request_refresh() and mark_builtin_widgets()
+    ''' Wrapper around ida_kernwin.request_refresh() and mark_builtin_widgets() 
     @param arg_mask bit masks of windows. see ida_kernwin.IWID_* for windows you can ask to refresh
     '''
     if ida_version() >= 930:
         _ida_kernwin.mark_builtin_widgets(mask=arg_mask, dirty=arg_dirty)
         return
-
+    
     _ida_kernwin.request_refresh(arg_mask)
-    return
+    return 
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _idaapi_retrieve_input_file_md5() -> bytes:
@@ -1341,20 +1341,20 @@ def ida_licence_info(arg_delete_user_info_from_IDB: bool = False) -> Dict[str, s
 def ida_licence_info_ex() -> Optional[str]:
     ''' Gets all info about the users licenses.
     To remove all this, see use ida_licence_info(arg_delete_user_info_from_IDB=True)
-
-    @returns a JSON string with all the info about the users license. (everything except the signature) '''
+    
+    @returns a JSON string with all the info about the users license. (everything except the signature) ''' 
     l_json_text = ""
     l_node = _ida_netnode.netnode("$ original user")
     if l_node == _ida_netnode.BADNODE:
         log_print("Something went wrong", arg_type="ERROR")
         return None
-
+    
     for i in range(16, 30):
         if l_node.supval(i):
             l_json_text += l_node.supstr(i)
         else:
             break
-
+    
     l_json_dict = _json.loads(l_json_text or "{}")
     res = _json.dumps(l_json_dict, ensure_ascii=False, indent=4, default=str)
     return res
@@ -1446,7 +1446,7 @@ def pe_header_compiled_time() -> str:
 
     l_timestamp_and_hash: bytes = l_pe_header[8:12]
     l_timestamp = int.from_bytes(l_timestamp_and_hash, byteorder="little")
-    l_datetime = _datetime.timetuple(_datetime.fromtimestamp(l_timestamp, tz=_timezone.utc))
+    l_datetime = _datetime.timetuple(_datetime.fromtimestamp(l_timestamp, tz=_timezone.utc)) 
 
     return _time.strftime(f"{_G_DEFAULT_TIME_FORMAT} (UTC)", l_datetime)
 
@@ -1480,7 +1480,7 @@ def pdb_load(arg_local_pdb_file: str = "",
              arg_debug: bool = False) -> Optional[bool]:
     ''' Try to load the PDB for this file.
     Code taken from <https://gist.github.com/patois/b3f329868934710fbc81218ce1d6d722>
-    Microsoft symbol server info: <https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols>
+    [Microsoft symbol server info](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)
 
     @param arg_local_pdb_file If you have a local PDB file, then set this. If this is not set then download from Microsofts Symbol server
     @param arg_image_base If you have a specific image base, then set this. If this is not set then use the image base from the file
@@ -1712,7 +1712,7 @@ def eval_expression(arg_expression: EvaluateType, arg_supress_error: bool = Fals
         return win_PEB(arg_debug=arg_debug)
 
     arg_expression = arg_expression.replace("`", "") # Handle WinDBGs funky address string.
-
+    
     if arg_expression.startswith(('-', '+')): # ida_kernwin.str2ea() behaves strange when the first character is either - or +
         l_sign: str = arg_expression[0]
         log_print(f"calling eval_expression() recursive with '{arg_expression[1:]}'", arg_debug)
@@ -1727,11 +1727,14 @@ def eval_expression(arg_expression: EvaluateType, arg_supress_error: bool = Fals
         l_parts = [x.strip() for x in arg_expression.split('+') if x]
         res = 0
         for l_part in l_parts:
-            res += eval_expression(l_part, arg_supress_error=arg_supress_error, arg_debug=arg_debug) # type: ignore[operator]
+            _t = eval_expression(l_part, arg_supress_error=arg_supress_error, arg_debug=arg_debug)
+            if _t is None:
+                return None
+            res += _t
         return res
-
+    
     debugger_refresh_memory_WARNING_VERY_EXPENSIVE()
-
+   
     if _re.fullmatch(r"^\d+$", arg_expression): # This regexp just means "all digits"
         arg_expression = arg_expression + "." # Transfor a number in string format (e.g. "22") --> "22." (parse as 22 in decimal and NOT in hex) This is done so eval_expression("11") == eval_expression("0+11"). ida_kernwin.str2ea("11") != ida_kernwin.str2ea("0+11")
 
@@ -1782,7 +1785,7 @@ def address(arg_label_or_address: EvaluateType, arg_supress_error: bool = False,
     Replacement for ida_name.get_name_ea()
     '''
     # _g_logger.debug("Called from", stacklevel=4) # Prints the caller of this function
-
+    
     # Resolve cursor relative jmps such as "+0x10" meaning current_address() + 0x10
     if isinstance(arg_label_or_address, int):
         res: Optional[int] = arg_label_or_address
@@ -1829,7 +1832,7 @@ def virtual_address_to_module_and_offset(arg_ea: EvaluateType, arg_debug: bool =
         l_module_str = l_module.name
     else:
         l_module_str = input_file.filename
-
+        
     l_rva_from_DLL = relative_virtual_address(arg_ea, arg_from_DLL_base=True, arg_debug=arg_debug)
     return f"{_os.path.basename(l_module_str)} + 0x{l_rva_from_DLL:x}"
 
@@ -1967,9 +1970,9 @@ def decompile_many(arg_outfile: str = "",
        @param arg_functions List of functions that should be decompiled, if this is empty then all functions that are not library functions are decompiled
        @param arg_allow_overwrite_c_file Default True. Create a new file or overwrite existing file, if this is False then the fail if the file already exists
     '''
-
+    
     # TODO: This function does not work very well, it's slow and the output file is very hard to read. Maybe I should emulate the function with my own loop?
-
+    
     _ida_auto.auto_wait() # We always want to have the auto analysis done before we start decompiling. This is important when we call this function in batch mode
 
     if not _ida_hexrays.init_hexrays_plugin():
@@ -2013,7 +2016,7 @@ def decompile_many(arg_outfile: str = "",
     decompiler_clear_cached_cfuncs()
     res = _ida_hexrays.decompile_many(arg_outfile, arg_functions, l_flags)
     log_print(f"done with decompile_many() --> {arg_outfile}", arg_type="INFO")
-
+    
     if (l_num_collapsed / len(l_randomly_picked_functions)) >= 0.25 :
         log_print(f"{l_num_collapsed} / {len(l_randomly_picked_functions)} randomly picked functions have collapsed local variables so I'm going to collapse them again", arg_type="INFO")
         _ = decompiler_set_config("COLLAPSE_LVARS", "YES")
@@ -2811,12 +2814,12 @@ def imports(arg_debug: bool = False) -> Dict[str, Dict[str, Tuple[int, int]]]:
         l_tmp_imported_function_info_dict[arg_name] = (arg_ea, arg_ordinal)
         return True # return True -> Continue enumeration, return False -> Stop enumeration
 
-    num_imported_modules = _ida_nalt.get_import_module_qty()
-    for i in range(0, num_imported_modules):
-        module_name = _ida_nalt.get_import_module_name(i).lower()
-        log_print(f"Found imported module: {module_name} with index {i}", arg_debug)
+    l_num_imported_modules = _ida_nalt.get_import_module_qty()
+    for i in range(0, l_num_imported_modules):
+        l_module_name = _ida_nalt.get_import_module_name(i)
+        log_print(f"Found imported module: {l_module_name} with index {i}", arg_debug)
         _ida_nalt.enum_import_names(i, __import_callback)
-        res[module_name] = l_tmp_imported_function_info_dict
+        res[l_module_name] = l_tmp_imported_function_info_dict
         # log_print(f"Module: {module_name} have the following imports: {[function_name for function_name in res[module_name]]}", arg_debug)
         l_tmp_imported_function_info_dict = {}
 
@@ -3026,7 +3029,7 @@ def bytes_restore_to_original(arg_ea: EvaluateType, arg_len: EvaluateType, arg_d
         log_print("eval_expression(arg_len) failed", arg_type="ERROR")
         return False
 
-    for i in range(l_len):
+    for i in range(l_len):   
         l_original_byte = _ida_bytes.get_original_byte(l_start_addr + i)
         if l_original_byte is None:
             log_print(f"get_original_byte(0x{l_start_addr + i:x}) failed", arg_type="ERROR")
@@ -3241,7 +3244,7 @@ def _normalize_encoding_name(arg_encoding: str, arg_debug: bool = False) -> str:
     except LookupError as e:
         log_print(f"Could not understand the encoding: {arg_encoding}, got exception: {e}. Returning default encoding: {_G_DEFAULT_ENCODING}", arg_type="ERROR")
         return _G_DEFAULT_ENCODING
-
+        
     log_print(f"codecs converted: {arg_encoding} --> {res}", arg_debug)
     return res
 
@@ -3428,7 +3431,7 @@ def strings(arg_only_first: int = 100_000, arg_debug: bool = False) -> List[_ida
         log_print(f'Found string at: 0x{string_item.ea:x}', arg_debug)
         l_idx += 1
         if l_idx >= arg_only_first:
-            log_print(f"Showing only first {arg_only_first} strings and I got to that number now", arg_type="WARNING")
+            log_print(f"Showing only first {arg_only_first} strings. There are more strings in the file.", arg_type="WARNING")
             break
     log_print(f"len(res) = {len(res)}", arg_debug)
     return res
@@ -3840,7 +3843,7 @@ def make_array(arg_ea: EvaluateType, arg_item_type: str, arg_number_of_items: in
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _idaapi_parse_binpat_str(arg_out: _ida_bytes.compiled_binpat_vec_t,
-                             arg_ea: int,
+                             arg_ea: int, 
                              arg_in: str,
                              arg_radix: int,
                              arg_strlits_encoding: int = 0) -> bool:
@@ -4207,7 +4210,7 @@ def file_write_patches_to_file(arg_validate_input_file: bool = True, arg_make_ba
         # OBS! I do NOT need to verify the original value, because the SHA-256 is either correct or the user passed arg_validate_input_file == False and then I don't care about the original value
         l_file_patcher.write(arg_patch_val.to_bytes(1, 'little'))
         return 0 # Return 0 to continue the enumeration
-
+    
     with open(l_write_path, 'rb+') as l_file_patcher:
         l_visitor_res = _ida_bytes.visit_patched_bytes(input_file.min_ea, input_file.max_ea, _visit_patched_bytes_callback)
 
@@ -4342,7 +4345,7 @@ def get_type(arg_name_or_ea: Union[EvaluateType, _ida_hexrays.lvar_t, _ida_typei
     if hasattr(arg_name_or_ea, 'type') and isinstance(arg_name_or_ea.type, _ida_typeinf.tinfo_t):
         log_print(f"arg_name_or_ea is of type: {type(arg_name_or_ea)} which have a member called 'type' which is of type ida_typeinf.tinfo_t", arg_debug)
         return arg_name_or_ea.type.copy()
-
+    
     if isinstance(arg_name_or_ea, str): # Are we sending in a parsable C type?
         log_print("arg_name_or_ea is a str, trying to convert it directly to a type", arg_debug)
         parsed_c_type = _parse_decl(arg_name_or_ea, arg_debug=arg_debug)
@@ -4458,6 +4461,11 @@ def _display_type_at_as_dict(arg_ea: EvaluateType,
                              arg_debug: bool = False) -> Optional[Dict[int, Tuple]]:
     ''' Like Windbgs command dt, this can show you an object pasted at a given address '''
     # TODO: This function is very brittle, test hard and maybe rewrite?
+    # TODO: Am I reinventing the wheel here? Look at:
+    # dos_tp = idaapi.Appcall.typedobj('IMAGE_DOS_HEADER;') # from https://github.com/allthingsida/allthingsida/blob/0bf54e148a212a59e64b72c19f6ae181cc633bcd/file-formats/pe-file/common.py#L12
+    # parsed = dos_tp.retrieve(addr)[1] # retreive returns a tuple (<read ok: int>, <parsed data object>:object)
+    # print([x for x in dir(parsed) if not x.startswith("__")])
+
     if arg_max_num_recursive < 1:
         log_print(f"Max recusive depth reached ({arg_max_num_recursive}), not going deeper.", arg_type="WARNING")
         return {}
@@ -4542,7 +4550,6 @@ def display_type_at(arg_ea: EvaluateType,
                     arg_max_num_recursive: int = 10,
                     arg_debug: bool = False) -> str:
     ''' Display the data as nice to look at. If you want to parse it, use _display_type_at_as_dict() '''
-    # TODO: Test case that is not correct: cb.clipboard_copy(cb.display_type_at(cb.win_PEB(), "_PEB"))
     return _json.dumps(_display_type_at_as_dict(arg_ea=arg_ea, arg_type=arg_type, arg_member_name="", arg_max_num_recursive=arg_max_num_recursive, arg_debug=arg_debug), ensure_ascii=False,  indent=4, default=str)
 
 dt = display_type_at # Windbg <3
@@ -5220,7 +5227,7 @@ def win_PEB(arg_debug: bool = False) -> Optional[int]:
     if not debugger_is_active():
         log_print("This function can only be called in an active debugging session", arg_type="ERROR")
         return None
-
+    
     if ida_version() >= 940:
         l_PEB: Optional[_ida_segment.segment_t] = None
         for l_segment in segments():
@@ -5240,7 +5247,7 @@ def win_PEB(arg_debug: bool = False) -> Optional[int]:
         teb_segm_name: str = f"TIB[{l_thread_id:08X}]"
         log_print(f"Segment with TEB/TIB information: '{teb_segm_name}'", arg_debug)
         l_TEB: Optional[_ida_segment.segment_t] = _ida_segment.get_segm_by_name(teb_segm_name)
-
+    
         if not l_TEB:
             log_print(f"Could not find any segment with the name: '{teb_segm_name}'", arg_type="ERROR")
             return None
@@ -5512,13 +5519,13 @@ if _G_QT_IS_AVAILABLE:
             arg_widget = TWidget(arg_widget)
 
         if arg_widget.as_TWidget_ptr() is None:
-            return
+            return 
         return _ida_kernwin.activate_widget(arg_widget._m_IDAs_TWidget_ptr, arg_take_focus)
 
     @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
     def _idaapi_display_widget(arg_widget: TWidget, arg_options: int = _ida_kernwin.WOPN_NOT_CLOSED_BY_ESC, arg_dest_ctrl: Optional[str] = None) -> None:
         '''Replacement for ida_kernwin.display_widget()
-
+        
         @param arg_options Flags from ida_kernwin.WOPN_* Read more: <https://cpp.docs.hex-rays.com/group___w_i_d_g_e_t___o_p_e_n.html>
 
         WARNING! Calling this on a window that has been closed crashes IDA. IDA Bug
@@ -5582,7 +5589,7 @@ if _G_QT_IS_AVAILABLE:
     def _idaapi_get_widget_vdui(arg_widget: TWidget) -> Optional[_ida_hexrays.vdui_t]:
         ''' replacement for ida_hexrays.get_widget_vdui()
         vdui is the Visual Decompiler User Interface. i.e. the pseudocode window.
-
+        
         [Read more at the official docs](https://cpp.docs.hex-rays.com/structvdui__t.html)
 
         @ return ida_hexrays.vdui_t of the pseudocode window if OK, None otherwise
@@ -5774,53 +5781,53 @@ def ida_output_text(arg_last_num_lines: int = -1, arg_clear_it_after: bool = Fal
         _ida_kernwin.process_ui_action("OutputClearContents") # TODO: Does not work when working from a external Jupyter console
     return res
 
-@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def _ipyida_find_connection_file(arg_copy_to_clipboard: bool = True) -> str:
-    ''' If you are using the excellent plugin [IPyIDA](https://github.com/eset/ipyida) then this function helps you to connect from the outside
-        @param arg_copy_to_clipboard Copy the command to the clipboard
-        @return The path to the connection file
-    '''
-    l_temp = _sys.modules.get("ipyida", None)
-    if l_temp is None:
-        l_download_command: str = f"wget -O \"{_os.path.join(ida_plugin_dirs()[0], 'ipyida_plugin_stub.py')}\" https://raw.githubusercontent.com/eset/ipyida/refs/heads/master/ipyida/ipyida_plugin_stub.py"
-        log_print(f"Plugin IPyIDA not found, you can install it with pip install ipyida and then run {l_download_command}", arg_type="ERROR")
-        if arg_copy_to_clipboard:
-            clipboard_copy(l_download_command)
-        return ""
-    res = l_temp.ida_plugin.ida_qtconsole.find_connection_file()
-    if arg_copy_to_clipboard:
-        clipboard_copy(res)
-    return res
+# TODO: Remove?
+# @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+# def _hype_find_connection_file(arg_copy_to_clipboard: bool = True) -> str:
+#     ''' I have a Jupyter Kernel plugin that I strongly recommend.
+#         You can find it here: https://github.com/Harding-Stardust/hype
+#         It is a replacement for IPyIDA
+#     '''
+#     l_hype = _sys.modules.get("__plugins__hype", None)
+#     if l_hype is None:
+#         l_download_command: str = f"wget -O \"{_os.path.join(ida_plugin_dirs()[0], 'hype.py')}\" https://raw.githubusercontent.com/Harding-Stardust/hype/refs/heads/main/hype.py"
+#         log_print(f"Plugin HYPE not found, you can install it with: {l_download_command}", arg_type="ERROR")
+#         if arg_copy_to_clipboard:
+#             clipboard_copy(l_download_command)
+#         return ""
+    
+#     res = l_hype.g_connection_file # Parsed dict: l_hype.g_app.get_connection_info()
+#     if arg_copy_to_clipboard:
+#         clipboard_copy(res)
+#     return res
 
-@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def ipyida_jupyter_console_from_shell(arg_copy_to_clipboard: bool = True) -> str:
-    ''' The command you can run in your shell to connect to [IPyIda](https://github.com/eset/ipyida) and have it outside of IDA (But IDA and IPyIDA must both be up and running)
-        [Read more at Hex-Rays blog](https://hex-rays.com/blog/plugin-focus-ipyida) # TODO: Verify that we really are using IpyIDA to the max
-        If you are having problems with the keyboard arrows, start powershell and then launch the Jupyter console from there.
-        @param arg_copy_to_clipboard Copy the command to the clipboard
-    '''
-    log_print("OBS! When leaving the external Jupyter-console, write: exit(keep_kernel=True)", arg_type="INFO")
-    l_connection_file: str = _ipyida_find_connection_file()
-    if l_connection_file:
-        res = f"jupyter-console --existing {l_connection_file}"
-        if arg_copy_to_clipboard:
-            clipboard_copy(res)
-        return res
-    return ""
+# @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+# def _hype_jupyter_console_from_shell(arg_copy_to_clipboard: bool = True) -> str:
+#     ''' The command you can run in your shell to connect to [HYPE](https://github.com/Harding-Stardust/hype) and have it outside of IDA (But IDA and HYPE must both be up and running)
+#         @param arg_copy_to_clipboard Copy the command to the clipboard
+#     '''
+#     log_print("OBS! When leaving the external Jupyter console press Ctrl+D or exit(keep_kernel=True)", arg_type="INFO")
+#     l_connection_file: str = _hype_find_connection_file()
+#     if l_connection_file:
+#         res = f"jupyter-console --existing {l_connection_file}"
+#         if arg_copy_to_clipboard:
+#             clipboard_copy(res)
+#         return res
+#     return ""
 
-@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def ipyida_exit(arg_copy_to_clipboard: bool = True) -> str:
-    ''' If you have connected to the Jupyter kernel from the shell using ipyida_jupyter_console_from_shell() use this command to exit the shell window without killing the kernel
-        @param arg_copy_to_clipboard Copy the command to the clipboard
-    '''
-    l_connection_file: str = _ipyida_find_connection_file()
-    if l_connection_file:
-        res = "exit(keep_kernel=True)"
-        if arg_copy_to_clipboard:
-            clipboard_copy(res)
-        log_print(f"This function does not do the exit, you need to paste in the following line in yout Jupyter console: {res}", arg_type="INFO")
-        return res
-    return ""
+# @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+# def _hype_exit(arg_copy_to_clipboard: bool = True) -> str:
+#     ''' If you have connected to the Jupyter kernel from the shell using _hype_jupyter_console_from_shell() use this command to exit the shell window without killing the kernel
+#         @param arg_copy_to_clipboard Copy the command to the clipboard
+#     '''
+#     l_connection_file: str = _hype_find_connection_file()
+#     if l_connection_file:
+#         res = "exit(keep_kernel=True)"
+#         if arg_copy_to_clipboard:
+#             clipboard_copy(res)
+#         log_print(f"This function does not do the exit, you need to paste in the following line in yout Jupyter console: {res}", arg_type="INFO")
+#         return res
+#     return ""
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def lumina_pull_all() -> bool:
@@ -6485,14 +6492,14 @@ def _test_TWidget(arg_debug: bool = False) -> bool:
     if not _G_QT_IS_AVAILABLE:
         log_print("Qt is not available, failing test", arg_type="ERROR")
         return False
-
+    
     l_last_widget: TWidget = _idaapi_get_last_widget()
     res = len(l_last_widget.window_title()) > 3
     if not res:
         log_print("Failed: len(l_last_widget.window_title()) > 3", arg_type="ERROR")
         return False
     log_print(f"l_last_widget: {l_last_widget}", arg_debug)
-
+    
     l_funcs_TWidget_ptr = _ida_kernwin.open_disasm_window("test_window")
     test_1 = TWidget(l_funcs_TWidget_ptr)
     log_print(str(test_1), arg_debug)
@@ -6676,7 +6683,7 @@ def _test_imports_and_exports(arg_debug: bool = False) -> bool:
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_instruction(arg_debug: bool = False) -> bool:
     ''' Test to decode bytes into an instruction '''
-
+    
     l_ins = instruction(address("rip"))
     if l_ins is None:
         log_print("RIP is not at any instruction", arg_type="ERROR")
@@ -6692,7 +6699,7 @@ def _test_instruction(arg_debug: bool = False) -> bool:
     if l_first_instruction_again is None:
         log_print("RIP is not at any instruction", arg_type="ERROR")
         return False
-
+    
     log_print(str(l_first_instruction_again), arg_debug)
     return str(l_ins) == str(l_first_instruction_again)
 
@@ -6738,7 +6745,7 @@ def _test_licence_ex(arg_debug: bool = False) -> bool:
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_all(arg_debug: bool = False) -> bool:
-    ''' Tests all tests we have so far. This is NOT complete and needs to be extended.
+    ''' Tests all tests we have so far. This is NOT complete and needs to be extended. 
     Every time I have to fix something in an update, I add a test for that.
     '''
     import coverage
@@ -6791,12 +6798,12 @@ def _test_all(arg_debug: bool = False) -> bool:
         log_print(f"All tests passed OK!", arg_type="INFO")
     else:
         log_print(f"Some tests failed!", arg_type="ERROR")
-
+    
     cov.stop()
     cov.save()
     cov.html_report(directory=l_report_dir)
-    _os.system(f"start {l_report_dir}/index.html")
-
+    _os.system(f"start {l_report_dir}/index.html")    
+    
     return res
 
 
