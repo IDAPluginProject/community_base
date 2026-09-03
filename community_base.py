@@ -73,7 +73,7 @@ Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-33-idas-user-directo
 
 from __future__ import annotations
 
-__version__ = "2026-09-01 22:42:01"
+__version__ = "2026-09-04 00:33:10"
 __author__ = "Harding"
 __description__ = __doc__
 __copyright__ = "Copyright 2026"
@@ -172,7 +172,20 @@ if _G_QT_IS_AVAILABLE:
 BufferType = Union[str, bytes, bytearray, List[str], List[bytes], List[bytearray]]
 BoolishType = Union[bool, int, str] # Can be evaluted to a bool by my function named _bool()
 # EvaluateType is anything that can be evalutad to an int. E.g. the address() function can take this type and then try to resolve an adress. Give it a str (a label) and it will work, give it a ida_segment.segment_t object and it will give the address to the start of the segment
-EvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
+BaseEvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
+try:
+    import ida_domain as _ida_domain  # type: ignore[import-untyped, import-not-found]
+    _PseudocodeFunc = _ida_domain.pseudocode.PseudocodeFunction
+    _MicroBlockArray = _ida_domain.microcode.MicroBlockArray
+    _MicroBlock = _ida_domain.microcode.MicroBlock
+    _StringItem = _ida_domain.strings.StringItem
+except ImportError:
+    class _PseudocodeFunc: pass  # type: ignore[no-redef]
+    class _MicroBlockArray: pass  # type: ignore[no-redef]
+    class _MicroBlock: pass  # type: ignore[no-redef]
+    class _StringItem: pass  # type: ignore[no-redef]
+EvaluateType = Union[BaseEvaluateType, _PseudocodeFunc, _MicroBlockArray, _MicroBlock, _StringItem]
+# EvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
 _G_LOG_EVERYTHING = False # If this is set to True, then all calls to log_print() will be printed, this can cause massive logs but good for hard to find bugs
 _G_DEFAULT_ENCODING: str = "utf-8"
 _G_DEFAULT_TIME_FORMAT: str = "%Y-%m-%d %H:%M:%S"
@@ -1710,13 +1723,14 @@ def eval_expression(arg_expression: EvaluateType, arg_supress_error: bool = Fals
         log_print(f"arg_expression is a {type(arg_expression)} which I can handle", arg_debug)
         return arg_expression.ea
 
-    l_known_address_attributes = ['ea',       # _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cexpr_t
-                                'start_ea', # _ida_hexrays.cfuncptr_t, _ida_segment.segment_t, _ida_range.range_t
-                                'entry_ea', # _ida_funcs.func_t
-                                'value',    # _ida_idaapi.PyIdc_cvt_int64__ (from appcalls in x64)
-                                'defea',    # _ida_hexrays.lvar_t
-                                'base'      # _ida_idd.modinfo_t
-                               ]
+    l_known_address_attributes: List[str] = [   'ea',       # _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cexpr_t
+                                                'start_ea', # _ida_hexrays.cfuncptr_t, _ida_segment.segment_t, _ida_range.range_t
+                                                'entry_ea', # _ida_funcs.func_t
+                                                'value',    # _ida_idaapi.PyIdc_cvt_int64__ (from appcalls in x64)
+                                                'defea',    # _ida_hexrays.lvar_t
+                                                'base',     # _ida_idd.modinfo_t
+                                                'address'   # _ida_domain.strings.StringItem
+                                            ]
 
     for l_attribute in l_known_address_attributes:
         if hasattr(arg_expression, l_attribute):
@@ -2069,9 +2083,11 @@ def decompiler_comments(arg_functions: Optional[Union[List[EvaluateType], Evalua
     @return Dict[ea: int, comment: str]
     '''
     if arg_functions and not isinstance(arg_functions, list):
-        arg_functions = [arg_functions]
+        l_functions_from_arg: List[EvaluateType] = [arg_functions]
+    else:
+        l_functions_from_arg = arg_functions
 
-    l_functions = [address(l_func, arg_debug=arg_debug) for l_func in arg_functions] if arg_functions else functions(arg_allow_library_functions=arg_allow_library_functions, arg_debug=arg_debug)
+    l_functions: List[int] = [address(l_func, arg_debug=arg_debug) for l_func in l_functions_from_arg] if l_functions_from_arg else functions(arg_allow_library_functions=arg_allow_library_functions, arg_debug=arg_debug)
 
     res: Dict[int, str] = {}
     for l_function in l_functions:
@@ -4189,7 +4205,7 @@ def file_write_patches_to_file(arg_validate_input_file: bool = True, arg_make_ba
     @param arg_make_backup If True, make a backup of the input file (original file name + timestamp + '.bak') in the same directory as the input file
     @return True if the patch was applied successfully, False otherwise
     '''
-    import shutil
+    import shutil as _shutil
     if arg_validate_input_file:
         if not _os.path.exists(input_file.filename):
             log_print(f"File '{input_file.filename}' does not exist", arg_type="ERROR")
@@ -4206,17 +4222,17 @@ def file_write_patches_to_file(arg_validate_input_file: bool = True, arg_make_ba
     if arg_make_backup:
         l_backup_file_path: str = input_file.filename + '.' + _time.strftime(_G_DEFAULT_TIME_FORMAT.replace('-','_').replace(' ','_').replace(':','_').replace('/','_'), _datetime.timetuple(_datetime.now())) + '.bak'
         log_print(f"Backing up to: {l_backup_file_path}", arg_type="INFO")
-        shutil.copyfile(input_file.filename, l_backup_file_path, follow_symlinks=True)
+        _shutil.copyfile(input_file.filename, l_backup_file_path, follow_symlinks=True)
 
     # Make sure we can write to the file, if we have a file open or a process running, we might need to save to another filename
     l_write_path: str = input_file.filename
     try:
-        with open(l_write_path, 'rb+') as l_test:
-            pass
+        with open(l_write_path, 'rb+'):
+            pass # We only want to test if the file can we written to
     except PermissionError:
         l_write_path = input_file.filename + '.patched'
         log_print(f"Cannot open '{input_file.filename}' for writing. Falling back to: '{l_write_path}'", arg_type="WARNING")
-        shutil.copyfile(input_file.filename, l_write_path, follow_symlinks=True)
+        _shutil.copyfile(input_file.filename, l_write_path, follow_symlinks=True)
 
     l_num_bytes_patched = 0
 
@@ -6534,12 +6550,13 @@ def _test_TWidget(arg_debug: bool = False) -> bool:
         log_print("Qt is not available, failing test", arg_type="ERROR")
         return False
 
-    l_last_widget: TWidget = _idaapi_get_last_widget()
-    res = len(l_last_widget.window_title()) > 3
+    l_current_viewer: TWidget = _idaapi_get_current_viewer()
+    log_print(f"l_current_viewer.window_title(): \"{l_current_viewer.window_title()}\"", arg_debug)
+    res = len(l_current_viewer.window_title()) > 3
     if not res:
-        log_print("Failed: len(l_last_widget.window_title()) > 3", arg_type="ERROR")
+        log_print("Failed: len(l_current_viewer.window_title()) > 3", arg_type="ERROR")
         return False
-    log_print(f"l_last_widget: {l_last_widget}", arg_debug)
+    log_print(f"l_current_viewer: {l_current_viewer}", arg_debug)
 
     l_funcs_TWidget_ptr = _ida_kernwin.open_disasm_window("test_window")
     test_1 = TWidget(l_funcs_TWidget_ptr)
@@ -6583,7 +6600,7 @@ def _test_Qt_stuff(arg_debug: bool = False) -> bool:
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_decompiler(arg_debug: bool = False) -> bool:
     ''' Tests: decompiler '''
-    l_pseudocode = decompiler_pseudocode(input_file.entry_point, arg_debug=arg_debug)
+    l_pseudocode = decompiler_pseudocode(registers.rip, arg_debug=arg_debug)
     log_print(f"pseudocode of entrypoint: {l_pseudocode}", arg_debug)
     res = len(l_pseudocode) > 10 and not l_pseudocode.startswith("<<<")
     return res
@@ -6783,6 +6800,22 @@ def _test_licence_ex(arg_debug: bool = False) -> bool:
         log_print(l_license_info, arg_debug)
     return True
 
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _test_ida_domain(arg_debug: bool = False) -> bool:
+    ''' Test how we compare to ida_domain '''
+    try:
+        import ida_domain as _ida_domain
+    except ImportError:
+        log_print("ida_domain is not installed. It is optional but quite nice. pip install ida_domain", arg_type="WARNING")
+        return True
+    l_db = _ida_domain.Database.open()
+    res = l_db.architecture == input_file.processor
+    res &= l_db.bytes.get_bytes_at(l_db.base_address, 0x10) == read_bytes(input_file.imagebase, 0x10)
+    res &= l_db.md5 == input_file.md5
+    # l_db.microcode.get_text()
+    l_db.close()
+    log_print(f"test_ida_domain: {res}", arg_debug)
+    return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_all(arg_debug: bool = False) -> bool:
@@ -6823,11 +6856,13 @@ def _test_all(arg_debug: bool = False) -> bool:
                         '_test_ida_is_running_in_batch_mode': _test_ida_is_running_in_batch_mode(arg_debug=arg_debug),
                         '_test_notepad_text': _test_notepad_text(arg_debug=arg_debug),
                         '_test_hex_dump': _test_hex_dump(arg_debug=arg_debug),
-                        '_test_licence_ex': _test_licence_ex(arg_debug=arg_debug)
+                        '_test_licence_ex': _test_licence_ex(arg_debug=arg_debug),
+                        '_test_ida_domain': _test_ida_domain(arg_debug=arg_debug)
                         }
-    log_print("---------------------------------------------------------------------------------------", arg_type="INFO")
-    log_print("-------------------------------- Start of test results --------------------------------", arg_type="INFO")
-    log_print("---------------------------------------------------------------------------------------", arg_type="INFO")
+    log_print("\n-----------------------------------\n"
+                "----------  test results ----------\n"
+                "-----------------------------------"
+                , arg_type="INFO")
     for l_test_name, l_test_result in l_test_functions.items():
         if l_test_result:
             log_print(f"{l_test_name}: {l_test_result}", arg_type="INFO")
