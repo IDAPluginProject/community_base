@@ -65,6 +65,7 @@ Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-33-idas-user-directo
 | Windows 10 | 9.4 | 3.14 | OK
 | Windows 10 | 9.4sp1 | 3.14 | OK
 | Windows 10 | 9.5 BETA 1 | 3.14 | OK
+| Windows 10 | 9.5 | 3.14 | OK
 
 # Future
 - I have not had the time to polish everything as much as I would have liked. Keep an eye on this repo and things will get updated!
@@ -75,11 +76,12 @@ Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-33-idas-user-directo
 
 from __future__ import annotations
 
-__version__ = "2026-10-07 03:04:33"
+__version__ = "2026-11-11 00:45:38"
 __author__ = "Harding"
 __description__ = __doc__
 __copyright__ = "Copyright 2026"
 __credits__ = ["https://www.youtube.com/@allthingsida",
+               "https://www.youtube.com/@Binary-Wizards",
                "https://github.com/grayhatacademy/ida/blob/master/plugins/shims/ida_shims.py",
                "https://github.com/arizvisa/ida-minsc",
                "https://github.com/Shizmob/ida-tools",
@@ -103,12 +105,15 @@ import ctypes as _ctypes
 import importlib.util as _importlib_util
 import importlib.machinery as _importlib_machinery
 import json as _json # TODO: Change to json5?
-from typing import Union, List, Dict, Tuple, Any, Optional, Callable, Set
+from typing import Union, List, Dict, Tuple, Any, Optional, Callable, Set, Literal, TYPE_CHECKING
 from types import ModuleType
+from dataclasses import dataclass as _dataclass
 import inspect as _inspect
 _missing_imports: List[str] = []
 try:
     from pydantic import validate_call
+    from pydantic.functional_validators import PlainValidator as _PlainValidator
+    from typing_extensions import Annotated as _Annotated # typing.Annotated is Python 3.9+, pydantic itself depends on typing_extensions
 except ImportError:
     _missing_imports.append("pydantic")
 try:
@@ -154,14 +159,24 @@ import ida_range as _ida_range # type: ignore[import-untyped]
 import ida_registry as _ida_registry # type: ignore[import-untyped]
 import ida_search as _ida_search # type: ignore[import-untyped]
 import ida_segment as _ida_segment # type: ignore[import-untyped]
+import ida_strlist as _ida_strlist # type: ignore[import-untyped]
 import idc as _idc # type: ignore[import-untyped]
 import ida_typeinf as _ida_typeinf # type: ignore[import-untyped]
 import ida_ua as _ida_ua # type: ignore[import-untyped] # ua stands for UnAssembly (I think...)  Functions that deal with the disassembling of program instructions. https://python.docs.hex-rays.com/namespaceida__ua.html
 import ida_xref as _ida_xref # type: ignore[import-untyped]
 import idautils as _idautils # type: ignore[import-untyped]
 import ida_diskio as _ida_diskio # type: ignore[import-untyped]
+try: # ida_lumina was adding in IDA 9.3
+    import ida_lumina as _ida_lumina # type: ignore[import-untyped, import-not-found] 
+except ImportError:
+    _ida_lumina = None  # Not available in this IDA version/edition
+try: # ida_license was adding in IDA 9.5
+    import ida_license as _ida_license # type: ignore[import-untyped, import-not-found]
+except ImportError:
+    _ida_license = None  # Not available in this IDA version/edition
 
 _G_QT_IS_AVAILABLE: bool = _ida_kernwin.is_idaq()
+_G_IS_IDA_LIBRARY: bool = bool(_ida_kernwin.is_ida_library(None, 0, None)) if hasattr(_ida_kernwin, "is_ida_library") else False # idalib (ida_domain). is_ida_library() is missing in IDA 8.4, which has no idalib
 if _G_QT_IS_AVAILABLE:
     try:
         # IDA 9.2+ uses PySide6 while earlier versions use PyQt5
@@ -176,33 +191,29 @@ BufferType = Union[str, bytes, bytearray, List[str], List[bytes], List[bytearray
 BoolishType = Union[bool, int, str] # Can be evaluted to a bool by my function named _bool()
 # EvaluateType is anything that can be evaluated to an int. E.g. the address() function can take this type and then try to resolve an address. Give it a str (a label) and it will work, give it a ida_segment.segment_t object and it will give the address to the start of the segment
 _BaseEvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
-try:
-    # TODO: Make sure the tests work without ida_domain, jupyter, qtconsole, jupyter-client
-    import ida_domain as _ida_domain  # type: ignore[import-untyped, import-not-found]
-    EvaluateType = Union[_BaseEvaluateType, _ida_domain.pseudocode.PseudocodeFunction, _ida_domain.microcode.MicroBlockArray, _ida_domain.microcode.MicroBlock, _ida_domain.strings.StringItem]
-except ImportError:
-    EvaluateType = _BaseEvaluateType  # type: ignore[misc]
+_G_IDA_DOMAIN_ADDRESS_ATTRIBUTES: Tuple[str, ...] = ("entry_ea", "start_ea", "address") # PseudocodeFunction + MicroBlockArray: entry_ea, MicroBlock: start_ea, StringItem: address. eval_expression() reads these
+
+def _validate_ida_domain_object(arg_value: Any) -> Any:
+    ''' Internal function. pydantic validator for the ida_domain part of EvaluateType.
+    Accepts objects from the ida_domain package (PseudocodeFunction, MicroBlockArray, MicroBlock, StringItem, ...) that have an address, WITHOUT importing ida_domain.
+    Importing ida_domain here is bad: idalib loads the plugins while "import ida_domain" is still running (circular import), and the GUI does not need it.
+
+    @param arg_value: The value pydantic validates
+    @return arg_value unchanged if it is an ida_domain object with an address, else ValueError (pydantic then tries the other types in EvaluateType)
+    '''
+    if type(arg_value).__module__.startswith("ida_domain.") and any(hasattr(arg_value, l_attribute) for l_attribute in _G_IDA_DOMAIN_ADDRESS_ATTRIBUTES):
+        return arg_value
+    raise ValueError(f"{type(arg_value)} is not an ida_domain object with any of the attributes {_G_IDA_DOMAIN_ADDRESS_ATTRIBUTES}")
+
+if TYPE_CHECKING: # Only seen by mypy, ida_domain is never imported at runtime. The runtime type below uses Any, which would turn off all mypy checks of EvaluateType
+    from ida_domain.pseudocode import PseudocodeFunction # type: ignore[import-not-found, unused-ignore] # ida_domain has py.typed. Not installed on e.g. IDA 8.4 machines, then mypy sees Any
+    from ida_domain.microcode import MicroBlockArray, MicroBlock # type: ignore[import-not-found, unused-ignore]
+    from ida_domain.strings import StringItem # type: ignore[import-not-found, unused-ignore]
+    EvaluateType = Union[_BaseEvaluateType, PseudocodeFunction, MicroBlockArray, MicroBlock, StringItem]
+else:
+    EvaluateType = Union[_BaseEvaluateType, _Annotated[Any, _PlainValidator(_validate_ida_domain_object)]]
 del _BaseEvaluateType
 
-# BaseEvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
-# try:
-#     import ida_domain as _ida_domain  # type: ignore[import-untyped, import-not-found]
-#     _PseudocodeFunc = _ida_domain.pseudocode.PseudocodeFunction
-#     _MicroBlockArray = _ida_domain.microcode.MicroBlockArray
-#     _MicroBlock = _ida_domain.microcode.MicroBlock
-#     _StringItem = _ida_domain.strings.StringItem
-# except ImportError:
-#     class _PseudocodeFunc: pass  # type: ignore[no-redef]
-#     class _MicroBlockArray: pass  # type: ignore[no-redef]
-#     class _MicroBlock: pass  # type: ignore[no-redef]
-#     class _StringItem: pass  # type: ignore[no-redef]
-# EvaluateType = Union[BaseEvaluateType, _PseudocodeFunc, _MicroBlockArray, _MicroBlock, _StringItem]
-
-
-
-
-
-# EvaluateType = Union[str, int, _ida_idp.reg_info_t, _ida_ua.insn_t, _ida_hexrays.cinsn_t, _ida_hexrays.cfuncptr_t, _ida_hexrays.cfunc_t, _ida_funcs.func_t, _ida_idaapi.PyIdc_cvt_int64__, _ida_segment.segment_t, _ida_ua.op_t, _ida_typeinf.funcarg_t, _idautils.Strings.StringItem, _ida_dbg.bpt_t, _ida_idd.modinfo_t, _ida_hexrays.carg_t, _ida_hexrays.cexpr_t, _ida_range.range_t]
 _G_LOG_EVERYTHING = False # If this is set to True, then all calls to log_print() will be printed, this can cause massive logs but good for hard to find bugs
 _G_DEFAULT_ENCODING: str = "utf-8"
 _G_DEFAULT_TIME_FORMAT: str = "%Y-%m-%d %H:%M:%S"
@@ -254,17 +265,31 @@ def _send_text_to_jupyter(arg_text: str) -> None:
 def _send_text_to_ida_output(arg_text: str) -> None:
     ''' Send text to IDA's output window with colors stripped.
         IDA's Qt5/Qt6 text widget does not support ANSI colors.
+        In idalib (ida_domain) IDA's console messages are off by default (idapro.enable_console_messages()), so msg() would show nothing.
+        The text is then written to stdout (the terminal) instead, unless a Jupyter kernel runs in this process: _send_text_to_jupyter() has already sent it there.
         @param arg_text: text to send to IDA's output window
         @return: None
     '''
-    _ida_kernwin.msg(_strip_ansi(arg_text.rstrip()+'\n'))
+    l_text: str = _strip_ansi(arg_text.rstrip()+'\n') # Stripped in the terminal too, the classic Windows console shows the escapes as garbage
+    if not _G_IS_IDA_LIBRARY:
+        _ida_kernwin.msg(l_text)
+        return
+
+    if _sys.modules.get('ipykernel') is not None:
+        try:
+            from ipykernel.kernelapp import IPKernelApp
+            if IPKernelApp.initialized(): return # The Jupyter frontend already got it, stdout would be the same cell again
+        except ImportError: # ipykernel is optional, a half installed one must not silence the log
+            pass
+    _sys.stdout.write(l_text)
+    _sys.stdout.flush()
     return
 
-# Global regex for stripping ANSI/terminal escape sequences.
+# Regex for stripping ANSI/terminal escape sequences. Compiled once here, _strip_ansi() runs on every log line.
 # Matches: ESC[ followed by parameters and a command letter (CSI sequences)
 #          ESC] followed by content and BEL or ST (OSC sequences)
 #          Other escape sequences
-_g_ANSI_STRIP_RE: _re.Pattern[str] = _re.compile(
+_G_ANSI_STRIP_RE: "_re.Pattern[str]" = _re.compile(
     r'\x1b'                        # ESC
     r'(?:'                         # non-capturing group for variations
     r'\[[0-9;?]*[A-Za-z]'          # CSI [...] (Control Sequence Introducer)
@@ -286,7 +311,7 @@ def _strip_ansi(arg_text: str) -> str:
     @param arg_text: text possibly containing ANSI escapes
     @return: text with ANSI escapes removed
     '''
-    return _g_ANSI_STRIP_RE.sub('', arg_text)
+    return _G_ANSI_STRIP_RE.sub('', arg_text)
 
 class ColoredFormatter(_logging.Formatter):
     ''' Formatter that adds ANSI color codes based on log level.
@@ -553,6 +578,7 @@ _g_links["getting_started_with_idapython"] =     "https://docs.hex-rays.com/deve
 _g_links["idapython_examples"] =                 "https://docs.hex-rays.com/developer-guide/idapython/idapython-examples"
 _g_links["porting_guide"] =                      "https://docs.hex-rays.com/developer-guide/idapython/idapython-porting-guide-ida-9"
 _g_links["HexRays_official_Youtube_channel"] =   "https://www.youtube.com/@HexRaysSA"
+_g_links["BinaryWizard_Youtube_channel"] =       "https://www.youtube.com/@binary-wizards"
 _g_links["AllThingsIDA_Youtube_channel"] =       "https://www.youtube.com/@allthingsida"
 _g_links["AllThingsIDA_github"] =                "https://github.com/allthingsida/allthingsida"
 _g_links["HexRays_official_plugins_repository"] ="https://plugins.hex-rays.com/"
@@ -611,15 +637,45 @@ def open_url(arg_text_blob_with_urls_in_it_or_function: Union[str, Callable]) ->
     # Check the docstring
     open_url(getattr(arg_text_blob_with_urls_in_it_or_function, "__doc__", None) or "")
 
-# TODO: Implement?
-# @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-# def ask_yn(arg_question: str) -> bool:
-#     ''' Asked the use a yes or no question. Works with Qt and with headless '''
-#     if __QT_IS_AVAILABLE:
-#         _ida_kernwin.ask_yn
-#     else:
-#         from IPython import get_ipython
-#         get_ipython().ask_yes_no("yes or no")
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def ask_yn(arg_question: str, arg_default: bool = True, arg_debug: bool = False) -> Optional[bool]:
+    ''' Ask the user a yes or no question. Works in the IDA GUI, in idat (text mode) and in lib-mode (idalib/ida_domain) from IPython/Jupyter or a console.
+    In batch mode (e.g. ida.exe -A -Smy_script.py) IDA answers with the default without asking.
+    In lib-mode without anyone to ask (no IPython and no console), the default is returned.
+
+    @param arg_question The question. Any text is OK, % is escaped since IDA reads the question as a printf format
+    @param arg_default The answer if the user just presses Enter, also the answer when there is no one to ask
+    @return True for yes, False for no, None if the user cancelled (Esc in IDA, Ctrl+C or end of input in the console)
+
+    Replacement for ida_kernwin.ask_yn()
+    '''
+    if _ida_kernwin.is_idaq() or not ida_is_running_in_batch_mode(): # The GUI and idat can show the question, in batch mode IDA itself returns the default
+        l_button: int = _ida_kernwin.ask_yn(_ida_kernwin.ASKBTN_YES if arg_default else _ida_kernwin.ASKBTN_NO, arg_question.replace("%", "%%")) # All IDA versions (also 9.5) use the question as a printf format, a lone % can crash IDA
+        log_print(f"ida_kernwin.ask_yn() returned {l_button}", arg_debug)
+        if l_button == _ida_kernwin.ASKBTN_CANCEL: return None
+        return l_button == _ida_kernwin.ASKBTN_YES
+
+    # lib-mode (idalib/ida_domain): there is no IDA UI. Ask in IPython/Jupyter or in a console, otherwise use the default
+    l_in_ipython: bool = False
+    try:
+        from IPython import get_ipython as _get_ipython
+        l_in_ipython = _get_ipython() is not None
+    except ImportError:
+        pass
+    if not l_in_ipython and not (_sys.stdin is not None and _sys.stdin.isatty()):
+        log_print(f"No one to ask '{arg_question}', using the default answer: {'yes' if arg_default else 'no'}", arg_type="WARNING")
+        return arg_default
+
+    l_hint: str = "[Y/n]" if arg_default else "[y/N]"
+    while True:
+        log_print("Waiting for an answer", arg_debug) # Also checks the clipboard for the abort string
+        try:
+            l_answer: str = input(f"{arg_question} {l_hint} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not l_answer: return arg_default
+        if l_answer in ("y", "yes"): return True
+        if l_answer in ("n", "no"): return False
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def bug_report(arg_bug_description: str, arg_module_to_blame: Union[str, ModuleType, None] = None) -> str:
@@ -661,27 +717,6 @@ def bug_report(arg_bug_description: str, arg_module_to_blame: Union[str, ModuleT
         # _ida_kernwin.open_url(l_github_issues + f"?title=bug&body={l_bug_report_as_str}")
 
     return l_bug_report_file
-
-@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def help(arg_search: str) -> List[Tuple[str, str]]:
-    ''' Search for a given string and show what function it is in.
-        @param arg_search is the text to search for
-
-        @return a list of tuples with the line of the match as the first member and the function name as the second value
-    '''
-    res = []
-    with open(__file__, "r", encoding="utf-8") as fp:
-        l_whole_file: List[str] = fp.readlines()
-
-    l_last_function: str = "<<< unknown function >>>"
-    for l_line in l_whole_file:
-        if "def " in l_line:
-            l_last_function = l_line.strip()
-
-        if arg_search in l_line:
-            res.append((l_line.strip(), l_last_function))
-
-    return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _dict_sort(arg_dict: Dict, arg_sort_by_value: bool = False, arg_descending: bool = False) -> Dict:
@@ -937,10 +972,9 @@ def _python_load_module(arg_filepath: str, arg_name: Optional[str] = None) -> Op
     try:
         from IPython import get_ipython as _get_ipython
         l_ipython = _get_ipython()
-        if l_ipython is None:
-            raise ModuleNotFoundError
-        l_ipython.user_ns[arg_name] = l_module
-    except ModuleNotFoundError:
+        if l_ipython is not None:
+            l_ipython.user_ns[arg_name] = l_module
+    except ImportError: # IPython is optional. ImportError and not only ModuleNotFoundError: a broken IPython install must not stop the module from being returned
         pass
 
     return l_module
@@ -975,7 +1009,7 @@ def _ida_DLL() -> Any: #  This used to be Union[_ctypes.CDLL, _ctypes.WinDLL] bu
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _loader_name() -> str:
     ''' Internal function. Example of how to use ctypes to call IDA C api.
-    Hex-Rays blog about it (OBS! Outdated!): <https://hex-rays.com/blog/calling-ida-apis-from-idapython-with-ctypes>
+    [Hex-Rays (outdated )blog about it](https://hex-rays.com/blog/calling-ida-apis-from-idapython-with-ctypes)
     [get_loader_name](https://cpp.docs.hex-rays.com/loader_8hpp.html#a9c79e47be0a36e47363409f3ce9ce6c5)
     '''
     l_IDA_dll = _ida_DLL()
@@ -995,7 +1029,7 @@ def hex_dump(arg_ea: Union[EvaluateType, bytes, bytearray], arg_len: Optional[Ev
     if isinstance(arg_ea, (bytes, bytearray)):
         l_len: Optional[int] = len(arg_ea) if arg_len is None else eval_expression(arg_len, arg_debug=arg_debug)
         if l_len is None:
-            log_print(f'eval_expression({arg_len}) failed')
+            log_print(f'eval_expression({arg_len}) failed', arg_type="ERROR")
             return
         l_bytes: bytes = bytes(arg_ea[0:l_len])
     else:
@@ -1096,7 +1130,6 @@ def _signed_hex_text(arg_expression: EvaluateType, arg_nbits: int = 0, arg_debug
         res = '+' + res
     return res
 
-@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _register_info_from_index(arg_register_index: int, arg_size_in_bytes: int) -> Optional[_ida_idp.reg_info_t]:
     ''' Internal function. Register number + size --> ida_idp.reg_info_t (also for registers that are not in registers._as_dict) '''
@@ -1204,8 +1237,8 @@ def _hex_str_if_int(arg_in: Any, arg_debug: bool = False) -> str:
     return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def clipboard_copy_hex_text_to_clipboard(arg_ea_start: EvaluateType = 0, arg_len: EvaluateType = 0, arg_debug: bool = False) -> None:
-    ''' Selected bytes will be copied as hex text to the clipboard '''
+def clipboard_copy_hex_text_to_clipboard(arg_ea_start: Optional[EvaluateType] = None, arg_len: Optional[EvaluateType] = None, arg_debug: bool = False) -> None:
+    ''' The bytes in the given range are copied as hex text to the clipboard. Without arguments (None) the selected bytes are copied, see dump_to_disk() '''
     _ = dump_to_disk(arg_ea_start=arg_ea_start, arg_len=arg_len, arg_filename="|clipboard|", arg_debug=arg_debug) # "|clipboard|" --> We don't actually dump to disk
     return
 
@@ -1362,17 +1395,13 @@ for _t_name, _t_function in _inspect.getmembers(_ida_xref, _inspect.isfunction):
 for _t_name, _t_function in _inspect.getmembers(_idautils, _inspect.isfunction): _add_link_to_docstring(_t_function)
 for _t_name, _t_function in _inspect.getmembers(_ida_diskio, _inspect.isfunction): _add_link_to_docstring(_t_function)
 for _t_name, _t_function in _inspect.getmembers(_ida_dirtree, _inspect.isfunction): _add_link_to_docstring(_t_function)
-
-if ida_version() >= 920:
-    _add_link_to_docstring(_ida_typeinf.func_type_data_t.set_cc, f"{_g_links['official_python_documentation']}/ida_typeinf/index.html#ida_typeinf.func_type_data_t.set_cc")
-
-if ida_version() >= 930:
-    import ida_lumina as _ida_lumina # type: ignore[import-untyped, import-not-found]
+if _ida_lumina is not None:
     for _t_name, _t_function in _inspect.getmembers(_ida_lumina, _inspect.isfunction): _add_link_to_docstring(_t_function)
+if _ida_license is not None:
+    for _t_name, _t_function in _inspect.getmembers(_ida_license, _inspect.isfunction): _add_link_to_docstring(_t_function)    
 
-if ida_version() >= 950:
-    import ida_license as _ida_license # type: ignore[import-untyped, import-not-found]
-    for _t_name, _t_function in _inspect.getmembers(_ida_license, _inspect.isfunction): _add_link_to_docstring(_t_function)
+if hasattr(_ida_typeinf.func_type_data_t, 'set_cc'):  # set_cc was added in IDA 9.2
+    _add_link_to_docstring(_ida_typeinf.func_type_data_t.set_cc, f"{_g_links['official_python_documentation']}/ida_typeinf/index.html#ida_typeinf.func_type_data_t.set_cc")
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _time_since(arg_timestamp_str: str, arg_now: str = "") -> str:
@@ -1410,7 +1439,6 @@ def _hotkey_str_fixer(arg_hotkey_str: str) -> str:
     ''' IDA is very picky on how you give the hotkey string '''
     return arg_hotkey_str.lower().replace('+', '-').replace(' ', '') # So very picky... >_<
 
-
 # @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 # def _last_errors() -> List[str]:
     # ''' Whenever I get an error that is not fatal, log it here so I can look it up later '''
@@ -1438,6 +1466,9 @@ def ida_license_info(arg_delete_user_info_from_IDB: bool = False) -> Dict[str, s
     For a very extensive information about the user, see ida_license_info_ex()
     
     Since IDA 9.5 there is also a module named ida_license that can be used
+    
+    # TODO: Rename this since this is reading from the IDB and not the installed license
+    # TODO: Replace this with ida_license_info_ex() ? 
 
     @return {serial_number: str, name_info: str}
     '''
@@ -1585,7 +1616,7 @@ def _pe_is_reproducible_build(arg_debug: bool = False) -> Optional[bool]:
         if not _ida_bytes.is_loaded(l_debug_directory_ea + l_offset + 0x0C):
             log_print(f"Debug directory at 0x{l_debug_directory_ea:x} is not loaded in the IDB", arg_debug)
             return None
-        l_type: int = _ida_bytes.get_dword(l_debug_directory_ea + l_offset + 0x0C) # IMAGE_DEBUG_DIRECTORY.Type
+        l_type: Optional[int] = dword(l_debug_directory_ea + l_offset + 0x0C) # IMAGE_DEBUG_DIRECTORY.Type
         if l_type == IMAGE_DEBUG_TYPE_REPRO:
             return True
     return False
@@ -1679,7 +1710,7 @@ def pdb_path() -> str:
     if l_pe_netnode == _ida_netnode.BADNODE:
         return ""
 
-    res = l_pe_netnode.supstr(0xFFFFFFFFFFFFFFF7)
+    res = l_pe_netnode.supstr(_ida_idaapi.BADADDR - 8) # PE_SUPSTR_PDBNM == nodeidx_t(-9) in the SDK (ldr/pe/pe.h). BADADDR - 8 is right for both 64-bit and 32-bit (IDA 8.4 ida.exe) addresses, a hard coded 0xFFFFFFFFFFFFFFF7 is only right for 64-bit
     if not res:
         return ""
 
@@ -2402,27 +2433,30 @@ def decompiler_variable_set_type(arg_function: EvaluateType,
     return _ida_hexrays.modify_user_lvar_info(l_function_address, _ida_hexrays.MLI_TYPE, l_lvar_saved_info)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def dump_to_disk(arg_ea_start: EvaluateType = 0,
-                 arg_len: EvaluateType = 0,
+def dump_to_disk(arg_ea_start: Optional[EvaluateType] = None,
+                 arg_len: Optional[EvaluateType] = None,
                  arg_filename: Optional[str] = None,
                  arg_xor_key: Optional[BufferType] = None,
                  arg_debug: bool = False
                  ) -> Optional[str]:
     ''' Dump bytes from the IDB to a file on disk.
     The hotkey is in the global variable _G_HOTKEY_DUMP_TO_DISK and is default set to 'w'
-    If arg_ea_start is given, then that range is dumped. If not (e.g. from the hotkey), then the selected bytes (or the item under the cursor) are dumped.
+    If arg_ea_start is given, then that range is dumped. If not (None, e.g. from the hotkey), then the selected bytes (or the item under the cursor) are dumped.
 
+    @param arg_ea_start The start of the range, None (default) means the selection in the GUI. 0 is a valid address
+    @param arg_len The number of bytes, must be given together with arg_ea_start
     @param arg_filename is this is set to the magic value "|clipboard|" then we will copy the string to the clipboard instead of writing it to disk
+    @param arg_xor_key XOR the bytes with this key (hex text) before they are written
 
     @return The filename we wrote the bytes to
     '''
 
-    if arg_ea_start and not arg_len:
-        log_print("You need to give arg_ea_start and arg_len OR select the range of bytes you want to dump.", arg_type="ERROR")
+    if (arg_ea_start is None) != (arg_len is None):
+        log_print("You need to give both arg_ea_start and arg_len OR none of them and select the range of bytes you want to dump.", arg_type="ERROR")
         return None
 
     l_valid_selection: bool = False
-    if arg_ea_start: # The caller told us what to dump, this always wins over whatever is selected in the GUI
+    if arg_ea_start is not None and arg_len is not None: # The caller told us what to dump, this always wins over whatever is selected in the GUI
         arg_ea_start = address(arg_ea_start, arg_debug=arg_debug)
         l_temp_len = eval_expression(arg_len, arg_debug=arg_debug)
         if l_temp_len is None:
@@ -2681,17 +2715,20 @@ def _idaapi_get_func_name(arg_ea: int) -> str:
     return _ida_funcs.get_func_name(arg_ea) or  ""
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def name(arg_ea: EvaluateType,
+def name(arg_ea: Union[EvaluateType, _ida_hexrays.lvar_t], # lvar_t is not in EvaluateType (it has no address), without it here pydantic stops the lvar_t before the code below that handles it
          arg_set_name: Optional[str] = None,
          arg_flags: int = _ida_name.SN_NOWARN | _ida_name.SN_NOCHECK,
          arg_force: bool = False,
          arg_demangle_name: bool = False,
+         arg_as_listing: bool = False,
          arg_debug: bool = False
          ) -> Optional[str]:
     ''' Gets or sets the name at the given EA (Effective Address)
 
     To remove a name (and give the function a name that IDA picks, use arg_set_name = ""
     @param arg_force: If the name exists, then append functionname_X incremental. Same as "Rename global item" in the decompiler.
+    @param arg_demangle_name: Return the long demangled name instead of the mangled name
+    @param arg_as_listing: Return the name exactly as the listing shows it (short demangled form, in IDA 9.5+ in backticks if it could merge with the text around it). Takes precedence over arg_demangle_name
 
     @return The name as str
 
@@ -2738,14 +2775,19 @@ def name(arg_ea: EvaluateType,
         l_func_start: int = _ida_funcs.get_func(l_addr).start_ea # Faster and safer than resolving the name again
         l_diff = l_addr - l_func_start
         l_name: str = l_function_name
-        if arg_demangle_name:
+        if arg_as_listing:
+            l_name = _idaapi_get_listing_name(l_func_start) or l_function_name
+        elif arg_demangle_name:
             # demangle_name() returns None for names that are not mangled (e.g. "main" or "sub_401000"), then keep the name as it is
             l_name = _idaapi_demangle_name(l_function_name, 0, _ida_name.DQT_FULL) or l_function_name
         if not l_diff:
             return l_name
         return f"{l_name} + 0x{l_diff:x}"
 
-    l_name = _ida_name.get_long_name(l_addr) if arg_demangle_name else _ida_name.get_name(l_addr)
+    if arg_as_listing:
+        l_name = _idaapi_get_listing_name(l_addr)
+    else:
+        l_name = _ida_name.get_long_name(l_addr) if arg_demangle_name else _ida_name.get_name(l_addr)
     if l_name:
         return l_name
 
@@ -2757,6 +2799,18 @@ def name(arg_ea: EvaluateType,
     return f"{l_addr:{l_address_formatstring}}"
 
 label = name # Other programs use the term label
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _idaapi_get_listing_name(arg_ea: int) -> str:
+    ''' Wrapper for ida_name.get_listing_name() (IDA 9.5+) that works in all IDA versions.
+    The name as the listing shows it: the short demangled form, in backticks if it could merge with the text around it (IDA 9.5+ allows names with almost any character).
+    Before IDA 9.5 there were no backticks, so ida_name.get_short_name() is used instead.
+
+    @param arg_ea The address of the name
+    @return The name, "" if there is no name at the address
+    '''
+    if hasattr(_ida_name, "get_listing_name"): return _ida_name.get_listing_name(arg_ea) or ""
+    return _ida_name.get_short_name(arg_ea) or ""
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _idaapi_demangle_name(arg_name: str, arg_disable_mask: int, arg_demreq=_ida_name.DQT_FULL) -> str:
@@ -3096,6 +3150,7 @@ def functions(arg_allow_library_functions: bool = True, arg_debug: bool = False)
     '''
     l_all_functions: List[int] = []
     for func_addr in _idautils.Functions():
+        log_print(f"Function at 0x{func_addr:x}", arg_debug) # Also checks if the user wants to abort (abort.ida in the clipboard)
         l_all_functions.append(func_addr)
 
     if arg_allow_library_functions:
@@ -3144,112 +3199,90 @@ def exports(arg_debug: bool = False) -> Dict[int, Tuple[int, int, str]]:
     return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _read_write_int(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType], arg_bits: int, arg_name: str, arg_getter: Callable[[int], Optional[int]], arg_patcher: Callable[[int, int], bool], arg_debug: bool = False) -> Optional[int]:
+    ''' Internal helper for byte(), word(), dword() and qword().
+    Reads an integer of arg_bits from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that value first and return the new value.
+    Accepts both signed and unsigned values (e.g. -1 --> 0xFF for a byte) '''
+
+    l_addr: int = address(arg_ea, arg_debug=arg_debug)
+    if l_addr == _ida_idaapi.BADADDR:
+        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
+        return None
+
+    if arg_set_value is None: return arg_getter(l_addr)
+
+    l_temp_value: Optional[int] = eval_expression(arg_set_value, arg_debug=arg_debug)
+    if l_temp_value is None:
+        log_print(f"arg_set_value: '{_hex_str_if_int(arg_set_value)}' could not be evaluated", arg_type="ERROR")
+        return None
+
+    l_min: int = -(1 << (arg_bits - 1))                                         # Smallest signed value, e.g. -0x80 for a byte
+    l_max: int = (1 << arg_bits) - 1                                            # Largest unsigned value, e.g. 0xFF for a byte
+    if not l_min <= l_temp_value <= l_max:
+        log_print(f"arg_set_value: '{_hex_str_if_int(arg_set_value)}' does not fit in a {arg_name} ({arg_bits} bits)", arg_type="ERROR")
+        return None
+
+    arg_patcher(l_addr, l_temp_value & l_max)                                   # Negative values --> two's complement in arg_bits
+    log_print(f"Wrote {arg_name} 0x{l_temp_value & l_max:x} to 0x{l_addr:x}", arg_debug)
+    return arg_getter(l_addr)                                                   # Read back so the caller sees what actually ended up in memory
+
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def byte(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
-    ''' Reads a byte (8 bits) from the IDB. OBS! The IDB might not match the file on disk or active memory
+    ''' Reads a byte (8 bits) from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that byte first and return the new value.
 
     Replacement for ida_bytes.get_byte() and ida_bytes.patch_byte()
 
     OBS! See ida_idd.dbg_read_memory(ea, size) for some other memory read
     '''
-    l_addr: int = address(arg_ea, arg_debug=arg_debug)
-    if l_addr == _ida_idaapi.BADADDR:
-        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
-        return None
-
-    if arg_set_value is not None:
-        l_value = eval_expression(arg_set_value, arg_debug=arg_debug)
-        if l_value is None:
-            log_print("arg_set_value evaluated to None", arg_type="ERROR")
-            return None
-
-        if l_value > 0xFF:
-            log_print(f"arg_set_value is too large for BYTE: 0x{l_value:x}", arg_type="ERROR")
-            return None
-
-        _ida_bytes.patch_byte(l_addr, l_value)
-
-    return _ida_bytes.get_byte(l_addr)
+    return _read_write_int(arg_ea, arg_set_value, 8, "BYTE", _ida_bytes.get_byte, _ida_bytes.patch_byte, arg_debug=arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def word(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
-    ''' Reads a word (16 bits) from the IDB. OBS! The IDB might not match the file on disk or active memory
+    ''' Reads a word (16 bits) from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that word first and return the new value.
 
     Replacement for ida_bytes.get_word() and ida_bytes.patch_word()
 
     OBS! See ida_idd.dbg_read_memory(ea, size) for some other memory read
     '''
-    l_addr: int = address(arg_ea, arg_debug=arg_debug)
-    if l_addr == _ida_idaapi.BADADDR:
-        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
-        return None
-
-    if arg_set_value is not None:
-        l_value = eval_expression(arg_set_value, arg_debug=arg_debug)
-        if l_value is None:
-            log_print("arg_set_value evaluated to None", arg_type="ERROR")
-            return None
-
-        if l_value > 0xFFFF:
-            log_print(f"arg_set_value is too large for WORD: 0x{l_value:x}", arg_type="ERROR")
-            return None
-
-        _ida_bytes.patch_word(l_addr, l_value)
-
-    return _ida_bytes.get_word(l_addr)
+    return _read_write_int(arg_ea, arg_set_value, 16, "WORD", _ida_bytes.get_word, _ida_bytes.patch_word, arg_debug=arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def dword(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
-    ''' Reads a dword (32 bits) from the IDB. OBS! The IDB might not match the file on disk or active memory
+    ''' Reads a dword (32 bits) from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that dword first and return the new value.
 
     Replacement for ida_bytes.get_dword() and ida_bytes.patch_dword()
 
     OBS! See ida_idd.dbg_read_memory(ea, size) for some other memory read
     '''
-    l_addr: int = address(arg_ea, arg_debug=arg_debug)
-    if l_addr == _ida_idaapi.BADADDR:
-        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
-        return None
-
-    if arg_set_value is not None:
-        l_value = eval_expression(arg_set_value, arg_debug=arg_debug)
-        if l_value is None:
-            log_print("arg_set_value evaluated to None", arg_type="ERROR")
-            return None
-
-        if l_value > 0xFFFFFFFF:
-            log_print(f"arg_set_value is too large for DWORD: 0x{l_value:x}", arg_type="ERROR")
-            return None
-
-        _ida_bytes.patch_dword(l_addr, l_value)
-
-    return _ida_bytes.get_dword(l_addr)
+    return _read_write_int(arg_ea, arg_set_value, 32, "DWORD", _ida_bytes.get_dword, _ida_bytes.patch_dword, arg_debug=arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def qword(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
-    ''' Reads a qword (64 bits) from the IDB. OBS! The IDB might not match the file on disk or active memory
+    ''' Reads a qword (64 bits) from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that qword first and return the new value.
 
     Replacement for ida_bytes.get_qword() and ida_bytes.patch_qword()
 
     OBS! See ida_idd.dbg_read_memory(ea, size) for some other memory read
     '''
-    l_addr: int = address(arg_ea, arg_debug=arg_debug)
-    if l_addr == _ida_idaapi.BADADDR:
-        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
-        return None
+    return _read_write_int(arg_ea, arg_set_value, 64, "QWORD", _ida_bytes.get_qword, _ida_bytes.patch_qword, arg_debug=arg_debug)
 
-    if arg_set_value is not None:
-        l_value = eval_expression(arg_set_value, arg_debug=arg_debug)
-        if l_value is None:
-            log_print("arg_set_value evaluated to None", arg_type="ERROR")
-            return None
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def oword(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
+    ''' Reads an oword (128 bits) from memory. If no memory is active, then read from the IDB.
+    If arg_set_value is set, then write that oword first and return the new value.
 
-        if l_value > 0xFFFFFFFFFFFFFFFF:
-            log_print(f"arg_set_value is too large for QWORD: 0x{l_value:x}", arg_type="ERROR")
-            return None
+    IDA has no get_oword() / patch_oword(), so this uses generic byte access with the byte order of the IDB
 
-        _ida_bytes.patch_qword(l_addr, l_value)
-
-    return _ida_bytes.get_qword(l_addr)
+    OBS! See ida_idd.dbg_read_memory(ea, size) for some other memory read
+    '''
+    l_getter, l_patcher = _make_generic_accessors(128)
+    return _read_write_int(arg_ea, arg_set_value, 128, "OWORD", l_getter, l_patcher, arg_debug=arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def read_bytes(arg_ea: EvaluateType, arg_len: EvaluateType, arg_debug: bool = False) -> Optional[bytes]:
@@ -3279,7 +3312,10 @@ def read_bytes(arg_ea: EvaluateType, arg_len: EvaluateType, arg_debug: bool = Fa
         log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
         return None
 
-    l_bytes: bytes = _ida_bytes.get_bytes(l_addr, l_len)
+    l_bytes: Optional[bytes] = _ida_bytes.get_bytes(l_addr, l_len)
+    if l_bytes is None: # ida_bytes.get_bytes() gives None when it fails
+        log_print(f"ida_bytes.get_bytes(0x{l_addr:x}, 0x{l_len:x}) failed", arg_type="ERROR")
+        return None
     if arg_debug:
         l_parsed_hex = " ".join(hex_parse(l_bytes))
         log_print(f"arg_ea = 0x{l_addr:x}, arg_len = 0x{l_len:x} resulted in '{l_parsed_hex}'", arg_debug)
@@ -3299,7 +3335,7 @@ def write_bytes(arg_ea: EvaluateType, arg_buf: Union[BufferType, int], arg_debug
         return False
 
     if isinstance(arg_buf, int):
-        if arg_buf <= 0xFF: # allow ints that is <= 1 Byte to be handled as the user probably wanted
+        if 0 <= arg_buf <= 0xFF: # allow ints that is <= 1 Byte to be handled as the user probably wanted. A negative int would crash in bytes.fromhex()
             l_buf: bytes = bytes.fromhex(f"{arg_buf:02x}")
         else:
             log_print(f'arg_buf is an int: {_hex_str_if_int(arg_buf)} but I need a buffer to write. (I actually am OK with a byte <= 0xFF also)', arg_type="ERROR")
@@ -3747,9 +3783,12 @@ def string(arg_ea: EvaluateType,
 
     Replacement for ida_bytes.get_strlit_contents() and idc.get_strlit_contents()
     '''
+    l_string_item_strtype: Optional[int] = None # Set when arg_ea is a StringItem, the string list knows the type of its own strings
     if isinstance(arg_ea, _idautils.Strings.StringItem):
         log_print("arg_ea is of type idautils.Strings.StringItem, I will use that info instead of rest of arguments", arg_debug)
-        l_type: int = arg_ea.strtype
+        if hasattr(arg_ea, "is_synthetic_string") and arg_ea.is_synthetic_string(): return arg_ea.synthetic_string # IDA 9.5+: a synthetic string (decompiler, Swift, plugin), the text is not in the bytes at ea
+        if hasattr(arg_ea, "is_decompiler_string") and arg_ea.is_decompiler_string(): return arg_ea.decompiler_string # IDA 9.4 and older: a decompiler string, the text is not in the bytes at ea
+        l_string_item_strtype = arg_ea.strtype
         arg_len = arg_ea.length
         arg_ea = arg_ea.ea
 
@@ -3765,10 +3804,11 @@ def string(arg_ea: EvaluateType,
         log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
         return None
 
+    l_type: int
     if isinstance(arg_encoding, str):
-        l_type = _encoding_to_strtype(arg_encoding) # TODO: This will overwrite l_type if it was set from StringItem, is this correct?
+        l_type = _encoding_to_strtype(arg_encoding) # An encoding from the caller wins over the type in a StringItem
         if l_type == -1:
-            log_print(f'_encoding_to_strtype("{arg_encoding}") failed')
+            log_print(f'_encoding_to_strtype("{arg_encoding}") failed', arg_type="ERROR")
             return None
     elif isinstance(arg_encoding, int):
         l_type = arg_encoding
@@ -3786,7 +3826,10 @@ def string(arg_ea: EvaluateType,
             _ida_bytes.create_strlit(l_addr, l_len, l_type)
         _ida_auto.auto_wait()
 
-    if arg_encoding is None:
+    if arg_encoding is None and l_string_item_strtype is not None:
+        # The string list (strings()) also has strings that are NOT defined as string literals in the IDB, ida_nalt.get_str_type() gives an invalid type (0xFFFFFF00) for those
+        l_type = l_string_item_strtype
+    elif arg_encoding is None:
         l_type = _ida_nalt.get_str_type(l_addr)
         if _is_invalid_strtype(l_type) and is_unknown(l_addr, arg_debug=arg_debug):
             # Unknown bytes (e.g. memory we just allocated) and no encoding given: guess the string type WITHOUT changing the IDB.
@@ -3795,6 +3838,12 @@ def string(arg_ea: EvaluateType,
             l_looks_like_utf16: bool = len(l_first_bytes) == 4 and l_first_bytes[0] != 0 and l_first_bytes[1] == 0 and l_first_bytes[2] != 0 and l_first_bytes[3] == 0
             l_type = _ida_nalt.STRTYPE_C_16 if l_looks_like_utf16 else _ida_nalt.STRTYPE_C
             log_print(f"0x{l_addr:x} is unknown bytes, guessing the string type: {'STRTYPE_C_16' if l_looks_like_utf16 else 'STRTYPE_C'}", arg_debug)
+    if _is_invalid_strtype(l_type) and (l_type & 0xFF) != 0xFF and (l_string_item_strtype is not None or _ida_bytes.is_strlit(_ida_bytes.get_flags(l_addr))):
+        # Old IDBs (made by old IDA versions) have string literals with the type 0xFFFFFF00: the low byte is a valid width/layout (0 == STRTYPE_C)
+        # but the terminator and encoding bytes are 0xFF (no encoding). IDA reads these fine (ida_bytes.get_strlit_contents()), so use the low byte with the default encoding.
+        # 0xFFFFFFFF (nothing at all at the address) is still invalid
+        log_print(f"String type 0x{l_type & 0xFFFFFFFF:x} at 0x{l_addr:x} has no encoding (old IDB?), using the width/layout in the low byte: 0x{l_type & 0xFF:x}", arg_debug)
+        l_type = l_type & 0xFF
     if _is_invalid_strtype(l_type):
         log_print(f"IDA doesn't think there is a string at {_hex_str_if_int(arg_ea)}. (0x{l_type:x} is not a valid string type).", arg_type="ERROR")
         l_item_head: int = _ida_bytes.get_item_head(l_addr)
@@ -3821,9 +3870,9 @@ def string(arg_ea: EvaluateType,
     try:
         res = l_bytes_read.decode(_idaapi_encoding_from_strtype(l_type))
         log_print(f'l_bytes_read.decode({_idaapi_encoding_from_strtype(l_type)}) OK!', arg_debug)
-    except:
-        l_bytes_read = _ida_bytes.get_strlit_contents(l_addr, l_len, l_type)
-        res = l_bytes_read.decode(_idaapi_encoding_from_strtype(l_type))
+    except (UnicodeError, LookupError): # The bytes are not valid in that encoding, or Python does not know the encoding name. OBS! Not a bare except: that also swallows the TimeoutError from log_print() (abort.ida)
+        l_strlit_contents: Optional[bytes] = _ida_bytes.get_strlit_contents(l_addr, l_len, l_type) # IDA converts the string to UTF-8, None on failure
+        res = l_strlit_contents.decode("utf-8", errors="replace") if l_strlit_contents else ""
         if not res:
             log_print(f'l_bytes_read.decode() failed. arg_ea: {_hex_str_if_int(arg_ea)}, l_type: 0x{l_type:x}, _idaapi_encoding_from_strtype(l_type): {_idaapi_encoding_from_strtype(l_type)}', arg_type="ERROR")
             return None
@@ -3869,16 +3918,22 @@ def wide_string(arg_ea: EvaluateType, arg_len: int = 0, arg_flags: int = _ida_by
 utf16_string = string_utf16 = wide_string
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def strings(arg_only_first: int = 100_000, arg_debug: bool = False) -> List[_idautils.Strings.StringItem]:
+def strings(arg_only_first: int = 100_000, arg_include_synthetic: bool = True, arg_debug: bool = False) -> List[_idautils.Strings.StringItem]:
     ''' Returns strings that IDA has found.
+    Each item has the property synthetic_provider (added by community_base): who made a synthetic string, None for a string that is in the bytes.
 
     @param arg_only_first: Only get the first X entries, default: 100_000 (should be enough for most programs)
+    @param arg_include_synthetic: Default True. Include synthetic strings: strings from the decompiler, Swift or a plugin whose text is NOT in the bytes at the address (IDA 9.5+, decompiler strings also before)
+    @return The string items
     '''
     # TODO: Add config to the arguments? Like arg_min_len = 10 ?
     res: List[_idautils.Strings.StringItem] = []
     l_strings = _idautils.Strings() # This is where IDA scans the database (ida_strlist.build_strlist()). TODO: Investigate if ida_domain should be used
     for string_item in l_strings:
         if string_item is None: # idautils.Strings yields None if ida_strlist.get_strlist_item_ex() fails, that would fail the validate_return on the whole list
+            continue
+        if not arg_include_synthetic and _string_item_synthetic_provider(string_item) is not None:
+            log_print(f'Skipping synthetic string at: 0x{string_item.ea:x}', arg_debug)
             continue
         res.append(string_item)
         log_print(f'Found string at: 0x{string_item.ea:x}', arg_debug) # Also checks the clipboard for the abort string, so a long loop can be stopped
@@ -3889,6 +3944,21 @@ def strings(arg_only_first: int = 100_000, arg_debug: bool = False) -> List[_ida
         log_print(f"Showing only first {arg_only_first} of {l_strings.size} strings.", arg_type="WARNING")
     log_print(f"len(res) = {len(res)}", arg_debug)
     return res
+
+def _string_item_synthetic_provider(arg_string_item: Any) -> Optional[str]:
+    ''' Internal function. Who made a synthetic string (a string whose text is not in the bytes at its address)?
+    Not decorated with @validate_call since it's called once per string by strings() and the StringItem.synthetic_provider property
+
+    @param arg_string_item An idautils.Strings.StringItem
+    @return The name of the provider, e.g. "SYNTHSTR_PROVIDER_DECOMPILER" or the name a plugin registered. None for a normal string
+    '''
+    if hasattr(arg_string_item, "is_synthetic_string"): # IDA 9.5+
+        if not arg_string_item.is_synthetic_string(): return None
+        l_registered_name: Optional[str] = _ida_strlist.synth_string_provider_name(arg_string_item.provider) # Set by plugins that register as a provider
+        if l_registered_name: return l_registered_name
+        return _int_to_str_dict_from_module(_ida_strlist, "SYNTHSTR_PROVIDER_.*").get(arg_string_item.provider, f"provider {arg_string_item.provider}")
+    if hasattr(arg_string_item, "is_decompiler_string") and arg_string_item.is_decompiler_string(): return "SYNTHSTR_PROVIDER_DECOMPILER" # IDA 9.4 and older only had decompiler strings
+    return None
 
 def _strings_profiled():
     r''' Internal function. Do not use.
@@ -4101,7 +4171,7 @@ def instruction_after(arg_ea: EvaluateType, arg_debug: bool = False) -> Optional
     @param arg_ea The address to get the instruction after
     @return The instruction object or None if it failed
     '''
-    return instruction(arg_ea=_ida_bytes.get_item_end(address(arg_ea, arg_debug=arg_debug) + 1), arg_debug=arg_debug)
+    return instruction(arg_ea=_ida_bytes.get_item_end(address(arg_ea, arg_debug=arg_debug)), arg_debug=arg_debug) # OBS! Not address + 1: after a 1 byte instruction that is already the next instruction, and get_item_end() of that skips one instruction
 
 def xrefs_to(arg_ea: EvaluateType, arg_debug: bool = False) -> Dict[int, _ida_xref.xrefblk_t]:
     ''' Replacement for idautils.XrefsTo()
@@ -4113,6 +4183,7 @@ def xrefs_to(arg_ea: EvaluateType, arg_debug: bool = False) -> Dict[int, _ida_xr
     res = {}
     l_addr: int = address(arg_ea, arg_debug=arg_debug)
     for l_xref_to in _idautils.XrefsTo(l_addr):
+        log_print(f"xref from 0x{l_xref_to.frm:x}", arg_debug) # Also checks if the user wants to abort (abort.ida in the clipboard)
         l_xref_to.type_name = _idautils.XrefTypeName(l_xref_to.type) # Add the type as a human readable string also. There is some black magic going on in _ida_xref.xrefblk_t.refs_from()
         res[l_xref_to.frm] = l_xref_to
 
@@ -4132,26 +4203,39 @@ def pointer_size(arg_debug: bool = False) -> int:
     return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _make_generic_accessors(arg_bits: int) -> Tuple[Callable[[int], Optional[int]], Callable[[int, int], bool]]:
+    ''' Creates a getter and a patcher for integers of arbitrary bit size, using the byte order of the IDB.
+    Used for non-standard pointer sizes (e.g. 20, 24 or 128 bits) '''
+
+    l_size: int = (arg_bits + 7) // 8                                           # Round up to whole bytes, e.g. 20 bits --> 3 bytes
+    l_mask: int = (1 << arg_bits) - 1
+    l_byteorder: Literal['little', 'big'] = 'big' if _ida_ida.inf_is_be() else 'little'
+
+    def l_getter(arg_addr: int) -> Optional[int]:
+        l_bytes: Optional[bytes] = _ida_bytes.get_bytes(arg_addr, l_size)
+        if l_bytes is None: return None
+        return int.from_bytes(l_bytes, l_byteorder) & l_mask                   # Drop padding bits when arg_bits is not a multiple of 8
+
+    def l_patcher(arg_addr: int, arg_value: int) -> bool:
+        _ida_bytes.patch_bytes(arg_addr, arg_value.to_bytes(l_size, l_byteorder))
+        return True
+
+    return l_getter, l_patcher
+
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def pointer(arg_ea: EvaluateType, arg_set_value: Optional[EvaluateType] = None, arg_debug: bool = False) -> Optional[int]:
     ''' Reads a pointer from memory. If no memory is active, then read from the IDB.
-    If arg_set_value is set, then write that pointer to the memory. The value does not have to be an address (e.g. 0 --> NULL). Works like WinDBG poi() '''
+    If arg_set_value is set, then write that pointer to the memory. The value does not have to be an address (e.g. 0 --> NULL). Works like WinDBG poi()
+    Standard sizes (16, 32, 64 bits) use word(), dword() and qword(). Other sizes use generic byte access '''
 
-    l_addr: int = address(arg_ea, arg_debug=arg_debug)
-    if l_addr == _ida_idaapi.BADADDR:
-        log_print(f"arg_ea: '{_hex_str_if_int(arg_ea)}' could not be located in the IDB", arg_type="ERROR")
-        return None
+    l_accessor: Optional[Callable[..., Optional[int]]] = {128: oword, 64: qword, 32: dword, 16: word}.get(input_file.bits)   # Fast path for known pointer sizes
+    if l_accessor is not None: return l_accessor(arg_ea, arg_set_value, arg_debug=arg_debug)
 
-    if arg_set_value is not None:
-        # eval_expression() and NOT address(): the value does not have to be a mapped address (e.g. NULL or a value outside the IDB)
-        l_temp_value: Optional[int] = eval_expression(arg_set_value, arg_debug=arg_debug)
-        if l_temp_value is None:
-            log_print(f"arg_set_value: '{_hex_str_if_int(arg_set_value)}' could not be evaluated", arg_type="ERROR")
-            return None
-        l_value: int = l_temp_value & ((1 << input_file.bits) - 1) if input_file.bits else l_temp_value # Negative values --> two's complement in the pointer size
-        res = qword(l_addr, l_value, arg_debug=arg_debug) if input_file.bits == 64 else dword(l_addr, l_value, arg_debug=arg_debug) if input_file.bits == 32 else word(l_addr, l_value, arg_debug=arg_debug)
-    else:
-        res = qword(l_addr, arg_debug=arg_debug) if input_file.bits == 64 else dword(l_addr, arg_debug=arg_debug) if input_file.bits == 32 else word(l_addr, arg_debug=arg_debug)
-    return res
+    log_print(f"Non-standard pointer size: {input_file.bits} bits, using generic byte access", arg_type="WARNING")
+    l_getter, l_patcher = _make_generic_accessors(input_file.bits)
+    return _read_write_int(arg_ea, arg_set_value, input_file.bits, f"{input_file.bits}-bit pointer", l_getter, l_patcher, arg_debug=arg_debug)
+    
 p = poi = ptr = pointer # WinDBG, I love you and I hate you
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
@@ -4635,6 +4719,7 @@ def decompiler_calls(arg_ea: EvaluateType, arg_debug: bool = False) -> Optional[
         log_print(f"Could not decompile '{_hex_str_if_int(arg_ea)}'", arg_type="ERROR")
         return None
     for item in l_cfunc.treeitems:
+        log_print(f"tree item at 0x{item.ea:x}", arg_debug) # Also checks if the user wants to abort (abort.ida in the clipboard)
         if item.to_specific_type.opname == 'call':
             res.append(item.to_specific_type.cexpr)
     return res
@@ -5401,7 +5486,7 @@ def debugger_process_list(arg_name_filter_regex: str = ".*", arg_debug: bool = F
         l_t_process_info = _ida_idd.process_info_t()
         l_t_process_info.name = l_process.name
         l_t_process_info.pid = l_process.pid
-        log_print(f"Process name: {l_t_process_info.pid}, PID: 0x{l_t_process_info.pid:x} ({l_t_process_info.pid})", arg_debug)
+        log_print(f"Process name: {l_t_process_info.name}, PID: 0x{l_t_process_info.pid:x} ({l_t_process_info.pid})", arg_debug)
         res.append(l_t_process_info)
     return res
 
@@ -5589,7 +5674,7 @@ def appcall(arg_function_name: EvaluateType,
 
     log_print(f"Calling ida_idd.Appcall.proto('{name(l_addr,arg_debug=arg_debug)}', '{l_function_prototype}')", arg_debug)
     res = _ida_idd.Appcall.proto(l_addr, l_function_prototype)
-    res.__doc__ = l_function_prototype
+    res.__doc__ = str(l_function_prototype) # A docstring must be a str, help() fails on a tinfo_t
     res.prototype = l_function_prototype
     return res
 
@@ -6337,10 +6422,21 @@ if _G_QT_IS_AVAILABLE:
         return ""
 
     @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-    def _idaapi_ask_file() -> Optional[TWidget]:
-        ''' TODO: Documentation. Replacement for ida_kernwin.ask_file() '''
-        # Crashing IDA: ida_kernwin.ask_file(True, "*.txt", "Select file with symbols info")
-        return _ida_kernwin.ask_file() # TODO: https://github.com/therealdreg/symseghelper/blob/0cce5d62890e044626f364fe2e60de4108e6f58d/ida_load_names.py#L35
+    def _idaapi_ask_file(arg_for_saving: bool = False, arg_default: Optional[str] = None, arg_prompt: str = "Select a file") -> Optional[str]:
+        ''' Wrapper for ida_kernwin.ask_file() that honors the type hints and works in all IDA versions.
+        IDA 9.5 changed the Python signature from ask_file(*args) to ask_file(for_saving, defval, prompt), the order of the arguments is the same in all versions.
+        IDA (also 9.5) uses the prompt as a printf format, so % is escaped. A lone % can crash IDA.
+
+        @param arg_for_saving True if the file will be written to, False if it will be read
+        @param arg_default The initial file name or wildcard, e.g. "*.txt", or None
+        @param arg_prompt The dialog title. It can start with "FILTER " and a filter description followed by a newline, e.g. "FILTER Text files|*.txt|Programs|*.exe;*.dll\nSelect a file"
+        @return The selected file name, None if the user cancelled
+
+        Replacement for ida_kernwin.ask_file()
+        '''
+        # Earlier note, not retested with this wrapper: "Crashing IDA: ida_kernwin.ask_file(True, "*.txt", "Select file with symbols info")"
+        # Example of use: https://github.com/therealdreg/symseghelper/blob/0cce5d62890e044626f364fe2e60de4108e6f58d/ida_load_names.py#L35
+        return _ida_kernwin.ask_file(arg_for_saving, arg_default, arg_prompt.replace("%", "%%"))
 
     @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
     def ida_main_window() -> Optional[TWidget]:
@@ -6394,6 +6490,9 @@ def ida_output_text(arg_last_num_lines: int = -1, arg_clear_it_after: bool = Fal
     res = res[::-1] # For some strange reason, the list is reversed so we turn it around
 
     if arg_clear_it_after:
+        if not _G_QT_IS_AVAILABLE: # TWidget only exists with the GUI
+            log_print("There is no GUI, so the Output window can not be cleared", arg_type="WARNING")
+            return res
         l_output_TWidget = TWidget("Output")
         l_output_TWidget.focus()
         _ida_kernwin.process_ui_action("OutputClearContents") # TODO: Does not work when working from a external Jupyter console
@@ -6466,6 +6565,95 @@ def lumina_push_all(arg_primary_server: bool) -> bool:
 
     return _ida_kernwin.process_ui_action('LuminaSecondaryPushAllMds')
 
+@_dataclass
+class LuminaRow():
+    ''' One function that a Lumina server has metadata for. lumina_view_all() returns a list of these '''
+    address: int        # Start of the function in the IDB
+    current_name: str   # The name in the IDB now
+    lumina_name: str    # The name on the Lumina server
+    size: int           # The size of the function according to the Lumina server
+    frequency: int      # How many times this metadata has been seen on the server
+    score: int          # ida_lumina.score_metadata(), higher means "better" metadata
+    metadata: bytes     # The raw metadata blob (type, comments, frame, ...). ida_lumina.split_metadata(metadata) splits it into KVP's
+
+    def __str__(self) -> str:
+        return f"0x{self.address:x}: {self.current_name} --> {self.lumina_name} (size: 0x{self.size:x}, frequency: {self.frequency}, score: {self.score})"
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def lumina_view_all(arg_functions: Optional[List[EvaluateType]] = None,
+                    arg_primary_server: bool = True,
+                    arg_increase_frequency: bool = False,
+                    arg_debug: bool = False) -> Optional[List[LuminaRow]]:
+    ''' Like Lumina -> View all functions in the GUI, but returned as a list: asks the Lumina server for the metadata of the functions.
+    NOTHING is applied to the IDB and nothing is pushed to the server (pull_md() without PULL_MD_AUTO_APPLY). Works headless (idalib/ida_domain) too.
+    The server and the credentials are the ones in IDA's settings, same as the GUI. Needs IDA 9.3 or newer (ida_lumina).
+
+    @param arg_functions: The functions to ask about. None (default) = all functions in the IDB
+    @param arg_primary_server: True (default) = the primary Lumina server, False = the secondary
+    @param arg_increase_frequency: False (default) sends PULL_MD_SEEN_FILE so the server does not count this pull as one more time the functions were seen
+    @param arg_debug: Log the result for every function
+
+    @return One LuminaRow per function the server has metadata for, in the order of arg_functions. [] if the server has nothing, None if Lumina is not available or the pull failed
+    '''
+    if _ida_lumina is None:
+        log_print("ida_lumina is missing, lumina_view_all() needs IDA 9.3 or newer", arg_type="ERROR")
+        return None
+
+    l_addresses: List[int] = []
+    if arg_functions is None:
+        l_addresses = functions(arg_debug=arg_debug)
+    else:
+        for l_function in arg_functions:
+            log_print(f"Resolving {_hex_str_if_int(l_function)}", arg_debug) # Also checks if the user wants to abort (abort.ida in the clipboard)
+            l_addresses.append(address(l_function, arg_debug=arg_debug))
+    if not l_addresses:
+        log_print("No functions to ask the Lumina server about", arg_type="WARNING")
+        return []
+
+    l_server_name: str = "primary" if arg_primary_server else "secondary"
+    l_client = _ida_lumina.get_server_connection2(_ida_lumina.LFEAT_PRIMARY_MD if arg_primary_server else _ida_lumina.LFEAT_SECONDARY_MD) # Connects if needed
+    if l_client is None:
+        log_print(f"Could not connect to the {l_server_name} Lumina server, check the Lumina settings in IDA (Options -> General -> Lumina)", arg_type="ERROR")
+        return None
+
+    l_eavec = _ida_pro.eavec_t()
+    for l_ea in l_addresses:
+        l_eavec.push_back(l_ea)
+    l_pull_md_flags: int = 0 if arg_increase_frequency else _ida_lumina.PULL_MD_SEEN_FILE # Never PULL_MD_AUTO_APPLY, nothing is applied to the IDB
+    log_print(f"Asking the {l_server_name} Lumina server about {len(l_addresses)} functions", arg_type="INFO")
+    l_result = l_client.pull_md(l_eavec, l_pull_md_flags)
+    if l_result is None:
+        log_print(f"pull_md() to the {l_server_name} Lumina server failed", arg_type="ERROR")
+        return None
+
+    # codes has one entry per asked function (same order as l_eavec), results has one entry per PDRES_OK code, in the same order
+    if len(l_result.codes) != len(l_eavec):
+        log_print(f"pull_md() returned {len(l_result.codes)} codes for {len(l_eavec)} functions, I cannot match them", arg_type="ERROR")
+        return None
+
+    res: List[LuminaRow] = []
+    l_result_index: int = 0
+    for l_index, l_code in enumerate(l_result.codes):
+        l_ea = l_eavec[l_index]
+        log_print(f"0x{l_ea:x}: code {l_code}", arg_debug) # Also checks if the user wants to abort (abort.ida in the clipboard)
+        if l_code != _ida_lumina.PDRES_OK:
+            continue
+        if l_result_index >= len(l_result.results):
+            log_print(f"pull_md() returned fewer results ({len(l_result.results)}) than PDRES_OK codes, the rest are skipped", arg_type="ERROR")
+            break
+        l_func_info = l_result.results[l_result_index]
+        l_result_index += 1
+        res.append(LuminaRow(address=l_ea,
+                             current_name=_ida_funcs.get_func_name(l_ea) or "",
+                             lumina_name=l_func_info.name,
+                             size=l_func_info.size,
+                             frequency=l_func_info.frequency,
+                             score=_ida_lumina.score_metadata(l_func_info),
+                             metadata=bytes(l_func_info.metadata)))
+
+    log_print(f"The {l_server_name} Lumina server has metadata for {len(res)} of {len(l_addresses)} functions", arg_type="INFO")
+    return res
+
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _idaapi_reg_data_type(arg_key: str, arg_subkey: Optional[str] = None) -> int:
     ''' Wrapper around ida_registry.reg_data_type() that honors the type hints
@@ -6523,11 +6711,11 @@ _G_CALLING_CONVENTION_INT_TO_STR: Dict[int, str] = _dict_sort(_int_to_str_dict_f
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def function_calling_convention(arg_ea: EvaluateType,
-                                arg_new_calling_convertion: Union[str, int] = -1,
+                                arg_new_calling_convention: Union[str, int] = -1,
                                 arg_cached_cfunc: Optional[_ida_hexrays.cfuncptr_t] = None,
                                 arg_debug: bool = False) -> int:
     ''' Gets or sets the calling convention of a function
-    @arg_new_calling_convertion ida_typeinf.CM_CC_* or the name of the calling convention, -1 means don't set any new calling convention
+    @param arg_new_calling_convention ida_typeinf.CM_CC_* or the name of the calling convention, -1 means don't set any new calling convention
     @return -1 on fail otherwise ida_typeinf.CM_CC_*
     '''
 
@@ -6547,30 +6735,30 @@ def function_calling_convention(arg_ea: EvaluateType,
     else:
         l_calling_convention &= l_function_details.cc
 
-    if arg_new_calling_convertion == -1:
+    if arg_new_calling_convention == -1:
         return l_calling_convention
 
     # If we get here, then we are setting a new calling convention
     # Smart convert the user input to a ida_typinf.CM_CC_*
-    if isinstance(arg_new_calling_convertion, str):
-        arg_new_calling_convertion = arg_new_calling_convertion.upper()
-        if arg_new_calling_convertion.startswith("__"):
-            arg_new_calling_convertion = arg_new_calling_convertion[2:]
+    if isinstance(arg_new_calling_convention, str):
+        arg_new_calling_convention = arg_new_calling_convention.upper()
+        if arg_new_calling_convention.startswith("__"):
+            arg_new_calling_convention = arg_new_calling_convention[2:]
 
-        if arg_new_calling_convertion == "USERCALL":
-            arg_new_calling_convertion = "SPECIAL"
-        elif arg_new_calling_convertion == "USERPURGE":
-            arg_new_calling_convertion = "SPECIALP"
+        if arg_new_calling_convention == "USERCALL":
+            arg_new_calling_convention = "SPECIAL"
+        elif arg_new_calling_convention == "USERPURGE":
+            arg_new_calling_convention = "SPECIALP"
 
-        if not arg_new_calling_convertion.startswith("CM_CC_"):
-            arg_new_calling_convertion = "CM_CC_" + arg_new_calling_convertion
-        log_print(f"Trying to look up: {arg_new_calling_convertion}", arg_debug)
-        res = _dict_swap_key_and_value(_G_CALLING_CONVENTION_INT_TO_STR).get(arg_new_calling_convertion, -1)
+        if not arg_new_calling_convention.startswith("CM_CC_"):
+            arg_new_calling_convention = "CM_CC_" + arg_new_calling_convention
+        log_print(f"Trying to look up: {arg_new_calling_convention}", arg_debug)
+        res = _dict_swap_key_and_value(_G_CALLING_CONVENTION_INT_TO_STR).get(arg_new_calling_convention, -1)
         if res == -1:
-            log_print(f"Failed to find: {arg_new_calling_convertion}", arg_type="ERROR")
+            log_print(f"Failed to find: {arg_new_calling_convention}", arg_type="ERROR")
             return -1
     else:
-        res = arg_new_calling_convertion
+        res = arg_new_calling_convention
 
     if res not in _G_CALLING_CONVENTION_INT_TO_STR:
         log_print(f"Invalid calling convention: {res}", arg_type="ERROR")
@@ -6592,17 +6780,17 @@ def function_convert_to_usercall(arg_ea: EvaluateType, arg_debug: bool = False) 
     Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-51-custom-calling-conventions>
     '''
     l_cfunc = decompile(arg_ea, arg_force_fresh_decompilation=True, arg_debug=arg_debug)
-    l_calling_convention: int = function_calling_convention(arg_ea=arg_ea, arg_new_calling_convertion=-1, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug)
+    l_calling_convention: int = function_calling_convention(arg_ea=arg_ea, arg_new_calling_convention=-1, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug)
     if l_calling_convention == -1:
         log_print("Got invalid calling convention, aborting", arg_type="ERROR")
         return False
 
     if l_calling_convention == _ida_typeinf.CM_CC_CDECL:
-        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convertion=_ida_typeinf.CM_CC_SPECIAL, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug) # __usercall
+        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convention=_ida_typeinf.CM_CC_SPECIAL, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug) # __usercall
     elif l_calling_convention in (_ida_typeinf.CM_CC_STDCALL, _ida_typeinf.CM_CC_FASTCALL, _ida_typeinf.CM_CC_PASCAL, _ida_typeinf.CM_CC_THISCALL):
-        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convertion=_ida_typeinf.CM_CC_SPECIALP, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug) # __userpurge
+        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convention=_ida_typeinf.CM_CC_SPECIALP, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug) # __userpurge
     elif l_calling_convention == _ida_typeinf.CM_CC_ELLIPSIS:
-        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convertion=_ida_typeinf.CM_CC_SPECIALE, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug)
+        function_calling_convention(arg_ea=arg_ea, arg_new_calling_convention=_ida_typeinf.CM_CC_SPECIALE, arg_cached_cfunc=l_cfunc, arg_debug=arg_debug)
     elif l_calling_convention == _ida_typeinf.CM_CC_SPECIALP: # __userpurge
         log_print(f"Function {_hex_str_if_int(arg_ea)} is already __userpurge", arg_type="WARNING")
     elif l_calling_convention == _ida_typeinf.CM_CC_SPECIAL: # __usercall
@@ -6636,20 +6824,22 @@ def function_set_return_type(arg_ea: EvaluateType, arg_new_ret_type: Union[str, 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def file_generate(arg_outfile_type: Union[str, int],
                            arg_out_file_path: str = "",
-                           arg_start_ea: EvaluateType = 0,
-                           arg_end_ea: EvaluateType = 0,
+                           arg_start_ea: Optional[EvaluateType] = None,
+                           arg_end_ea: Optional[EvaluateType] = None,
                            arg_flags: int = 0,
                            arg_debug: bool = False) -> str:
     ''' Generate a new file from the input file. This function is very weird since there is an option to generate EXE file but when you pick it in the menu, IDA say that this is not supported?!
 
     @param arg_outfile_type is either a string with the "ASM", "DIF", "EXE", "IDC", "LST" or "MAP". If it is an int, then it should be one of ida_loader.OFILE_*
     @param arg_out_file_path Filename to save to, it not set then use input_file.idb_path + "extension generated from the arg_outfile_type"
-    @param arg_start_ea start from this EA (Effective Address)
-    @param arg_end_ea end at this EA (Effective Address)
+    @param arg_start_ea start from this EA (Effective Address), None (default) means input_file.min_ea. 0 is a valid address
+    @param arg_end_ea end at this EA (Effective Address), None (default) means input_file.max_ea
     @param arg_flags see ida_loader.GENFLG_*
 
     @return The file path I wrote the result to, empty str if something failed
     '''
+    # TODO: Verify this with IDA 9.5 since they changed how to generate the HTML at least
+    
     l_ofile_int_to_str = _int_to_str_dict_from_module(_ida_loader, "OFILE_.*")
     l_ofile_str_to_int = _dict_swap_key_and_value(l_ofile_int_to_str)
     if isinstance(arg_outfile_type, str):
@@ -6657,7 +6847,7 @@ def file_generate(arg_outfile_type: Union[str, int],
             arg_outfile_type = "OFILE_" + arg_outfile_type.upper()
 
         if arg_outfile_type not in l_ofile_str_to_int:
-            log_print(f"Invalid arg_outfile_type, valid: {l_ofile_str_to_int.keys()}")
+            log_print(f"Invalid arg_outfile_type, valid: {l_ofile_str_to_int.keys()}", arg_type="ERROR")
             return ""
 
         l_outfile_type: int = l_ofile_str_to_int[arg_outfile_type]
@@ -6665,14 +6855,17 @@ def file_generate(arg_outfile_type: Union[str, int],
         l_outfile_type = arg_outfile_type
 
     if l_outfile_type not in l_ofile_int_to_str:
-        log_print(f"Invalid arg_outfile_type, valid: {l_ofile_str_to_int.keys()}")
+        log_print(f"Invalid arg_outfile_type, valid: {l_ofile_str_to_int.keys()}", arg_type="ERROR")
         return ""
 
     l_expected_extension = l_ofile_int_to_str[l_outfile_type][6:].lower()
 
     l_outfile_path = arg_out_file_path if arg_out_file_path else input_file.idb_path + "." + l_expected_extension
-    l_start_ea = address(arg_start_ea, arg_debug=arg_debug) if arg_start_ea else input_file.min_ea
-    l_end_ea = address(arg_end_ea, arg_debug=arg_debug) if arg_end_ea else input_file.max_ea
+    l_start_ea = input_file.min_ea if arg_start_ea is None else address(arg_start_ea, arg_debug=arg_debug)
+    l_end_ea = input_file.max_ea if arg_end_ea is None else address(arg_end_ea, arg_debug=arg_debug)
+    if _ida_idaapi.BADADDR in (l_start_ea, l_end_ea):
+        log_print(f"Could not resolve the range {_hex_str_if_int(arg_start_ea)} --> {_hex_str_if_int(arg_end_ea)}", arg_type="ERROR")
+        return ""
 
     # Code taken from https://github.com/HexRaysSA/IDAPython/blob/d12e31eae9d678f647013527596a715dd378f989/examples/disassembler/produce_lst_file.py#L32
     l_file_wrapper = _ida_fpro.qfile_t() # FILE * wrapper
@@ -6723,9 +6916,7 @@ def _instruction_is_same_as_nop(arg_instruction: EvaluateType, arg_debug: bool =
     l_ins = instruction(arg_instruction, arg_debug=arg_debug)
     if l_ins is None:
         return None
-    if l_ins.itype == _ida_allins.NN_nop: # e.g. nop
-        return True
-    if _ida_idp.ph_get_id() != _ida_idp.PLFM_386: # The NN_* itypes below are only valid for x86/x64
+    if _ida_idp.ph_get_id() != _ida_idp.PLFM_386: # The NN_* itypes below are only valid for x86/x64, on another processor the same number is some other instruction
         return False
     if l_ins.itype == _ida_allins.NN_nop: # e.g. nop
         return True
@@ -6766,36 +6957,52 @@ def _instruction_is_jcc(arg_instruction: _ida_ua.insn_t) -> bool:
         return arg_instruction.itype in _conditional_jmps_x64
     return _instruction_jumps(arg_instruction) and not _bool(_ida_idp.has_insn_feature(arg_instruction.itype, _ida_idp.CF_STOP)) and not _ida_idp.is_call_insn(arg_instruction) # Jumps but can also continue to the next instruction
 
-setattr(_ida_ua.insn_t, '__str__', disassemble)
-setattr(_ida_ua.insn_t, '__repr__', __repr__type_address_str)
-setattr(_ida_ua.insn_t, '__len__', lambda self: self.size)
-setattr(_ida_ua.insn_t, '__bytes__',  lambda self: self.bytes)
-setattr(_ida_ua.insn_t, 'instruction_before', property(fget=instruction_before))
-setattr(_ida_ua.insn_t, 'previous_instruction', property(fget=instruction_before))
-setattr(_ida_ua.insn_t, 'instruction_after', property(fget=instruction_after))
-setattr(_ida_ua.insn_t, 'next_instruction', property(fget=instruction_after))
-setattr(_ida_ua.insn_t, 'operands', property(fget=lambda self: [op for op in self.ops if op.type != _ida_ua.o_void])) # Replacement for ida_ua.insn_t.ops. _ida_ua.insn_t.ops is always 8 elements long even if there are not that many operands
-setattr(_ida_ua.insn_t, 'operands_as_dict', property(fget=lambda self: [_operand_parser(op, self) for op in self.operands], doc='Same as op_t.as_dict for every operand, but also correct for r8-r15 in [base + index * scale] on x64 (the REX prefix is in the instruction)'))
-setattr(_ida_ua.insn_t, 'function', property(fget=function))
-setattr(_ida_ua.insn_t, 'mnemonic', property(fget=lambda self: _ida_ua.print_insn_mnem(address(self)).lower(), doc='Get the mnemonic. e.g. "MOV EAX, EBX" --> "mov"'))
-setattr(_ida_ua.insn_t, 'bytes', property(fget=lambda self: read_bytes(self.ea, _ida_bytes.get_item_size(self.ea)), doc='Get the byte values that makes up this instruction'))
-setattr(_ida_ua.insn_t, 'is_jmp', property(fget=_instruction_is_jmp, doc='Is the instruction an unconditional JMP?'))
-setattr(_ida_ua.insn_t, 'comment', property(fget=_comment_get, fset=_comment_set)) # type: ignore[arg-type]
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _patch_ida_class(arg_class: Any, arg_name: str, arg_value: Any) -> None:
+    ''' Internal function. setattr() on one of IDA's classes, but ONLY in the real module (import community_base), never in the plugin copy (__plugins__community_base).
+    The IDA classes are shared by both copies of this file, so the copy that runs last would win. The patches use this module's globals (e.g. registers),
+    which are only refreshed by the callback in the real module. Other plugins that "import community_base" before IDA runs this plugin file would otherwise
+    get the plugin copy's patches with stale globals.
+
+    @param arg_class: The IDA class to patch, e.g. ida_ua.insn_t
+    @param arg_name: The attribute name
+    @param arg_value: The new attribute (function, property, lambda)
+    @return None
+    '''
+    if _is_running_as_plugin(): return
+    setattr(arg_class, arg_name, arg_value)
+    return
+
+_patch_ida_class(_ida_ua.insn_t, '__str__', disassemble)
+_patch_ida_class(_ida_ua.insn_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_ua.insn_t, '__len__', lambda self: self.size)
+_patch_ida_class(_ida_ua.insn_t, '__bytes__',  lambda self: self.bytes)
+_patch_ida_class(_ida_ua.insn_t, 'instruction_before', property(fget=instruction_before))
+_patch_ida_class(_ida_ua.insn_t, 'previous_instruction', property(fget=instruction_before))
+_patch_ida_class(_ida_ua.insn_t, 'instruction_after', property(fget=instruction_after))
+_patch_ida_class(_ida_ua.insn_t, 'next_instruction', property(fget=instruction_after))
+_patch_ida_class(_ida_ua.insn_t, 'operands', property(fget=lambda self: [op for op in self.ops if op.type != _ida_ua.o_void])) # Replacement for ida_ua.insn_t.ops. _ida_ua.insn_t.ops is always 8 elements long even if there are not that many operands
+_patch_ida_class(_ida_ua.insn_t, 'operands_as_dict', property(fget=lambda self: [_operand_parser(op, self) for op in self.operands], doc='Same as op_t.as_dict for every operand, but also correct for r8-r15 in [base + index * scale] on x64 (the REX prefix is in the instruction)'))
+_patch_ida_class(_ida_ua.insn_t, 'function', property(fget=function))
+_patch_ida_class(_ida_ua.insn_t, 'mnemonic', property(fget=lambda self: _ida_ua.print_insn_mnem(address(self)).lower(), doc='Get the mnemonic. e.g. "MOV EAX, EBX" --> "mov"'))
+_patch_ida_class(_ida_ua.insn_t, 'bytes', property(fget=lambda self: read_bytes(self.ea, _ida_bytes.get_item_size(self.ea)), doc='Get the byte values that makes up this instruction'))
+_patch_ida_class(_ida_ua.insn_t, 'is_jmp', property(fget=_instruction_is_jmp, doc='Is the instruction an unconditional JMP?'))
+_patch_ida_class(_ida_ua.insn_t, 'comment', property(fget=_comment_get, fset=_comment_set)) # type: ignore[arg-type]
 _conditional_jmps_x64 = [_ida_allins.NN_ja, _ida_allins.NN_jae, _ida_allins.NN_jb, _ida_allins.NN_jbe, _ida_allins.NN_jc, _ida_allins.NN_jcxz, _ida_allins.NN_je, _ida_allins.NN_jecxz, _ida_allins.NN_jg, _ida_allins.NN_jge, _ida_allins.NN_jl, _ida_allins.NN_jle, _ida_allins.NN_jna, _ida_allins.NN_jnae, _ida_allins.NN_jnb, _ida_allins.NN_jnbe, _ida_allins.NN_jnc, _ida_allins.NN_jne, _ida_allins.NN_jng, _ida_allins.NN_jnge, _ida_allins.NN_jnl, _ida_allins.NN_jnle, _ida_allins.NN_jno, _ida_allins.NN_jnp, _ida_allins.NN_jns, _ida_allins.NN_jnz, _ida_allins.NN_jo, _ida_allins.NN_jp, _ida_allins.NN_jpe, _ida_allins.NN_jpo, _ida_allins.NN_jrcxz, _ida_allins.NN_js, _ida_allins.NN_jz]
-setattr(_ida_ua.insn_t, 'is_jcc', property(fget=_instruction_is_jcc, doc='Is the instruction a conditional JMP?'))
-setattr(_ida_ua.insn_t, 'is_call', property(fget=_ida_idp.is_call_insn, doc='Is the instruction a call?'))
-setattr(_ida_ua.insn_t, 'is_ret', property(fget=_ida_idp.is_ret_insn, doc='Is the instruction a return?'))
-setattr(_ida_ua.insn_t, 'is_same_as_nop', property(fget=_instruction_is_same_as_nop, doc='Is the instruction a NOP? (or code that does nothing e.g. mov rax, rax)'))
-setattr(_ida_funcs.func_t, '__str__', lambda self: f"name: {_ida_funcs.get_func_name(self.start_ea)},  start_ea: 0x{self.start_ea:x}, end_ea: 0x{self.end_ea:x}")
-setattr(_ida_funcs.func_t, '__repr__', __repr__type_address_str)
-setattr(_ida_funcs.func_t, '__len__', lambda self: self.end_ea - self.start_ea)
-setattr(_ida_funcs.func_t, 'decompiled', property(fget=decompile, doc="Returns a ida_hexrays.cfuncptr_t, same as the decompile() function returns"))
-setattr(_ida_funcs.func_t, 'prototype', property(fget=function_prototype, fset=set_type)) # type: ignore[arg-type]
-setattr(_ida_funcs.func_t, 'name', property(fget=name, fset=name, doc="Get or set the name of the function")) # type: ignore[arg-type]
-setattr(_ida_funcs.func_t, 'address', property(fget=address))
-setattr(_ida_funcs.func_t, 'return_type', property(fget=lambda self: decompile(self).type.get_rettype())) # type: ignore[union-attr]
-setattr(_ida_funcs.func_t, 'is_library_function', property(fget=function_is_library_function))
-setattr(_ida_funcs.func_t, 'is_lumina_name', property(fget=function_is_lumina_name))
+_patch_ida_class(_ida_ua.insn_t, 'is_jcc', property(fget=_instruction_is_jcc, doc='Is the instruction a conditional JMP?'))
+_patch_ida_class(_ida_ua.insn_t, 'is_call', property(fget=_ida_idp.is_call_insn, doc='Is the instruction a call?'))
+_patch_ida_class(_ida_ua.insn_t, 'is_ret', property(fget=_ida_idp.is_ret_insn, doc='Is the instruction a return?'))
+_patch_ida_class(_ida_ua.insn_t, 'is_same_as_nop', property(fget=_instruction_is_same_as_nop, doc='Is the instruction a NOP? (or code that does nothing e.g. mov rax, rax)'))
+_patch_ida_class(_ida_funcs.func_t, '__str__', lambda self: f"name: {_ida_funcs.get_func_name(self.start_ea)},  start_ea: 0x{self.start_ea:x}, end_ea: 0x{self.end_ea:x}")
+_patch_ida_class(_ida_funcs.func_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_funcs.func_t, '__len__', lambda self: self.end_ea - self.start_ea)
+_patch_ida_class(_ida_funcs.func_t, 'decompiled', property(fget=decompile, doc="Returns a ida_hexrays.cfuncptr_t, same as the decompile() function returns"))
+_patch_ida_class(_ida_funcs.func_t, 'prototype', property(fget=function_prototype, fset=set_type)) # type: ignore[arg-type]
+_patch_ida_class(_ida_funcs.func_t, 'name', property(fget=name, fset=name, doc="Get or set the name of the function")) # type: ignore[arg-type]
+_patch_ida_class(_ida_funcs.func_t, 'address', property(fget=address))
+_patch_ida_class(_ida_funcs.func_t, 'return_type', property(fget=lambda self: decompile(self).type.get_rettype())) # type: ignore[union-attr]
+_patch_ida_class(_ida_funcs.func_t, 'is_library_function', property(fget=function_is_library_function))
+_patch_ida_class(_ida_funcs.func_t, 'is_lumina_name', property(fget=function_is_lumina_name))
 
 __GLOBAL_KEEP_REFERENCE_TO_AVOID_MEMORY_CORRUPTION__ = 0
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
@@ -6820,11 +7027,11 @@ def _function_arguments(arg_ea: EvaluateType, arg_debug: bool = False) -> Option
     __GLOBAL_KEEP_REFERENCE_TO_AVOID_MEMORY_CORRUPTION__ = l_funcdata
     return l_funcdata
 
-setattr(_ida_funcs.func_t, 'arguments', property(fget=_function_arguments))
-setattr(_ida_funcs.func_t, 'calls', property(fget=assembler_calls))
-setattr(_ida_funcs.func_t, '__call__', lambda *args: appcall(args[0])(*args[1:])) # type: ignore[misc] # py_lstrcmpA = cb.function("lstrcmpA"); py_lstrcmpA("input_text", "input_text") # TODO: This is dangerous, maybe remove?
-setattr(_ida_funcs.func_t.__call__, '__doc__', f"Calls the function via AppCall. Read more: {links()['links']['appcall_guide']}")
-setattr(_ida_funcs.func_t, '__bytes__', lambda f: read_bytes(f.start_ea, f.end_ea - f.start_ea)) # end_ea is exclusive, OBS! Function tails (chunks) are not included
+_patch_ida_class(_ida_funcs.func_t, 'arguments', property(fget=_function_arguments))
+_patch_ida_class(_ida_funcs.func_t, 'calls', property(fget=assembler_calls))
+_patch_ida_class(_ida_funcs.func_t, '__call__', lambda *args: appcall(args[0])(*args[1:])) # type: ignore[misc] # py_lstrcmpA = cb.function("lstrcmpA"); py_lstrcmpA("input_text", "input_text") # TODO: This is dangerous, maybe remove?
+_patch_ida_class(_ida_funcs.func_t.__call__, '__doc__', f"Calls the function via AppCall. Read more: {links()['links']['appcall_guide']}")
+_patch_ida_class(_ida_funcs.func_t, '__bytes__', lambda f: read_bytes(f.start_ea, f.end_ea - f.start_ea)) # end_ea is exclusive, OBS! Function tails (chunks) are not included
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _argloc_t_type_to_str(arg_argloc: Union[_ida_typeinf.argloc_t, _ida_typeinf.funcarg_t]) -> Optional[str]:
     ''' Internal function. Convert the int from argloc.atype() to a human readable string '''
@@ -6838,9 +7045,9 @@ def _argloc_t_type_to_str(arg_argloc: Union[_ida_typeinf.argloc_t, _ida_typeinf.
         return None
 
     return res
-setattr(_ida_typeinf.argloc_t, '__str__', _argloc_t_type_to_str)
-setattr(_ida_typeinf.argloc_t, '__repr__', __repr__type_str)
-setattr(_ida_typeinf.argloc_t, 'atype_as_str', property(fget=_argloc_t_type_to_str))
+_patch_ida_class(_ida_typeinf.argloc_t, '__str__', _argloc_t_type_to_str)
+_patch_ida_class(_ida_typeinf.argloc_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_typeinf.argloc_t, 'atype_as_str', property(fget=_argloc_t_type_to_str))
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _funcarg_t_str(arg_funcarg_t: _ida_typeinf.funcarg_t) -> str:
     ''' Internal function. Makes a nice string from a ida_typeinf.funcarg_t object '''
@@ -6850,32 +7057,32 @@ def _funcarg_t_str(arg_funcarg_t: _ida_typeinf.funcarg_t) -> str:
         res += f'\nRegister: {str(arg_funcarg_t.register.name)}: {(f"0x{_register(arg_funcarg_t.register):x}" if debugger_is_active() else "<value only available when debugger is active>")}'
     # TODO: elif on stack: print stack var
     return res
-setattr(_ida_typeinf.funcarg_t, '__str__', _funcarg_t_str)
-setattr(_ida_typeinf.funcarg_t, '__repr__', __repr__type_str)
-setattr(_ida_typeinf.funcarg_t, 'size', property(fget=lambda self: len(self.type)))
-setattr(_ida_typeinf.funcarg_t, 'register', property(fget=lambda self: registers._as_dict[_ida_idp.get_reg_name(self.argloc.reg1(), self.size)] if self.argloc.is_reg1() else None))
-setattr(_ida_typeinf.func_type_data_t, '__str__', lambda self: '[ ' + "\n\n".join([repr(funcarg_t) for funcarg_t in self]) + '\n]')
-setattr(_ida_typeinf.func_type_data_t, '__repr__', __repr__type_str)
-setattr(_ida_typeinf.tinfo_t, '__repr__', __repr__type_str)
-setattr(_ida_typeinf.tinfo_t, '__len__', lambda self: self.get_size() if self.get_size() != _ida_typeinf.BADSIZE else 0)
-setattr(_ida_typeinf.tinfo_t, '__bool__', lambda self: self.is_well_defined())
-setattr(_ida_typeinf.tinfo_t, 'size', property(fget=len))
-setattr(_ida_typeinf.tinfo_t, 'return_type', property(fget=lambda self: self.get_rettype() if self.is_func() or self.is_funcptr() else None))
+_patch_ida_class(_ida_typeinf.funcarg_t, '__str__', _funcarg_t_str)
+_patch_ida_class(_ida_typeinf.funcarg_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_typeinf.funcarg_t, 'size', property(fget=lambda self: len(self.type)))
+_patch_ida_class(_ida_typeinf.funcarg_t, 'register', property(fget=lambda self: registers._as_dict[_ida_idp.get_reg_name(self.argloc.reg1(), self.size)] if self.argloc.is_reg1() else None))
+_patch_ida_class(_ida_typeinf.func_type_data_t, '__str__', lambda self: '[ ' + "\n\n".join([repr(funcarg_t) for funcarg_t in self]) + '\n]')
+_patch_ida_class(_ida_typeinf.func_type_data_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_typeinf.tinfo_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_typeinf.tinfo_t, '__len__', lambda self: self.get_size() if self.get_size() != _ida_typeinf.BADSIZE else 0)
+_patch_ida_class(_ida_typeinf.tinfo_t, '__bool__', lambda self: self.is_well_defined())
+_patch_ida_class(_ida_typeinf.tinfo_t, 'size', property(fget=len))
+_patch_ida_class(_ida_typeinf.tinfo_t, 'return_type', property(fget=lambda self: self.get_rettype() if self.is_func() or self.is_funcptr() else None))
 
 # TODO: add details for ida_typeinf.udt_type_data_t
 
-setattr(_ida_kernwin.simpleline_t, '__str__', lambda self: _ida_lines.tag_remove(self.line))
-setattr(_ida_kernwin.simpleline_t, '__repr__', __repr__type_str)
-setattr(_ida_pro.strvec_t, '__str__', lambda self: "\n".join([str(simpleline) for simpleline in self]))
-setattr(_ida_segment.segment_t, '__repr__', __repr__type_str)
-setattr(_ida_segment.segment_t, '__str__', lambda self: f".name_as_str: {self.name_as_str}, .class_as_str: {self.class_as_str}, .start_ea: 0x{self.start_ea:x}, .end_ea: 0x{self.end_ea:x}, .readable: {self.readable}, .writable: {self.writable}, .executable: {self.executable}")
-setattr(_ida_segment.segment_t, '__len__', lambda self: self.size())
-setattr(_ida_segment.segment_t, 'readable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_READ), fset=lambda self, value: _segment_permissions(self, arg_readable=value))) # type: ignore[arg-type]
-setattr(_ida_segment.segment_t, 'writable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_WRITE), fset=lambda self, value: _segment_permissions(self, arg_writable=value))) # type: ignore[arg-type]
-setattr(_ida_segment.segment_t, 'executable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_EXEC), fset=lambda self, value: _segment_permissions(self, arg_executable=value))) # type: ignore[arg-type]
-setattr(_ida_segment.segment_t, 'name_as_str', property(fget=_ida_segment.get_segm_name, fset=_ida_segment.set_segm_name)) # '.name' is already taken but it contains an int?
-setattr(_ida_segment.segment_t, 'class_as_str', property(fget=_ida_segment.get_segm_class, fset=_ida_segment.set_segm_class))
-setattr(_ida_segment.segment_t, 'bits', property(fget=lambda self: 0x10 << self.bitness))
+_patch_ida_class(_ida_kernwin.simpleline_t, '__str__', lambda self: _ida_lines.tag_remove(self.line))
+_patch_ida_class(_ida_kernwin.simpleline_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_pro.strvec_t, '__str__', lambda self: "\n".join([str(simpleline) for simpleline in self]))
+_patch_ida_class(_ida_segment.segment_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_segment.segment_t, '__str__', lambda self: f".name_as_str: {self.name_as_str}, .class_as_str: {self.class_as_str}, .start_ea: 0x{self.start_ea:x}, .end_ea: 0x{self.end_ea:x}, .readable: {self.readable}, .writable: {self.writable}, .executable: {self.executable}")
+_patch_ida_class(_ida_segment.segment_t, '__len__', lambda self: self.size())
+_patch_ida_class(_ida_segment.segment_t, 'readable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_READ), fset=lambda self, value: _segment_permissions(self, arg_readable=value))) # type: ignore[arg-type]
+_patch_ida_class(_ida_segment.segment_t, 'writable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_WRITE), fset=lambda self, value: _segment_permissions(self, arg_writable=value))) # type: ignore[arg-type]
+_patch_ida_class(_ida_segment.segment_t, 'executable', property(fget=lambda self: _bool(self.perm & _ida_segment.SEGPERM_EXEC), fset=lambda self, value: _segment_permissions(self, arg_executable=value))) # type: ignore[arg-type]
+_patch_ida_class(_ida_segment.segment_t, 'name_as_str', property(fget=_ida_segment.get_segm_name, fset=_ida_segment.set_segm_name)) # '.name' is already taken but it contains an int?
+_patch_ida_class(_ida_segment.segment_t, 'class_as_str', property(fget=_ida_segment.get_segm_class, fset=_ida_segment.set_segm_class))
+_patch_ida_class(_ida_segment.segment_t, 'bits', property(fget=lambda self: 0x10 << self.bitness))
 _G_DATA_TYPE_SIZES_IN_BYTES: Dict[int, int] = {_ida_ua.dt_byte: 1, _ida_ua.dt_word: 2, _ida_ua.dt_dword: 4, _ida_ua.dt_qword: 8, _ida_ua.dt_float: 4, _ida_ua.dt_double: 8, _ida_ua.dt_byte16: 16, _ida_ua.dt_byte32: 32, _ida_ua.dt_byte64: 64, _ida_ua.dt_half: 2}
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _op_t_is_reg(self: _ida_ua.op_t, arg_register_name_or_index: Union[int, str, _ida_idp.reg_info_t]) -> bool:
@@ -6892,7 +7099,7 @@ def _op_t_is_reg(self: _ida_ua.op_t, arg_register_name_or_index: Union[int, str,
     # isinstance(arg_register_name_or_index, _ida_idp.reg_info_t):
     return arg_register_name_or_index.reg == self.reg and _G_DATA_TYPE_SIZES_IN_BYTES[self.dtype] == arg_register_name_or_index.size
 
-setattr(_ida_ua.op_t, 'is_reg', _op_t_is_reg)
+_patch_ida_class(_ida_ua.op_t, 'is_reg', _op_t_is_reg)
 _operand_type = _int_to_str_dict_from_module(_ida_ua, "o_.*")
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _op_t__str__(self: _ida_ua.op_t, arg_debug: bool = False) -> str:
@@ -6933,8 +7140,8 @@ def _op_t__str__(self: _ida_ua.op_t, arg_debug: bool = False) -> str:
 
     log_print("Could not parse the given ida_ua.op_t.", arg_type='ERROR')
     return "<<< invalid operand, could _NOT_ parse it >>>"
-setattr(_ida_ua.op_t, '__str__', _op_t__str__)
-setattr(_ida_ua.op_t, '__repr__', lambda self: f"{type(self)} with operand_type {_operand_type.get(self.type, '<unknown ida_ua.o_???>')} which has str():\n{str(self)}")
+_patch_ida_class(_ida_ua.op_t, '__str__', _op_t__str__)
+_patch_ida_class(_ida_ua.op_t, '__repr__', lambda self: f"{type(self)} with operand_type {_operand_type.get(self.type, '<unknown ida_ua.o_???>')} which has str():\n{str(self)}")
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _op_t_to_register(arg_operand: _ida_ua.op_t, arg_debug: bool = False) -> Optional[_ida_idp.reg_info_t]:
     ''' Get the register as ida_idp.reg_info_t '''
@@ -6949,77 +7156,78 @@ def _op_t_to_register(arg_operand: _ida_ua.op_t, arg_debug: bool = False) -> Opt
     # log_print(f"arg_operand is {str(arg_operand)} which is something I cannot handle right now", arg_type="ERROR")
     return None
 
-setattr(_ida_ua.op_t, 'register', property(fget=_op_t_to_register))
-setattr(_ida_ua.op_t, 'name', property(fget=name))
-setattr(_ida_ua.op_t, '__len__', lambda self: _G_DATA_TYPE_SIZES_IN_BYTES[self.dtype])
-setattr(_ida_ua.op_t, 'as_dict', property(fget=_operand_parser))
-setattr(_ida_ua.op_t, '__eq__', lambda self, other: isinstance(other, _ida_ua.op_t) and self.type == other.type and self.dtype == other.dtype and self.value == other.value and self.value64 == other.value64 and self.specflag1 == other.specflag1 and self.specflag2 == other.specflag2 and self.reg == other.reg and self.addr == other.addr)
-setattr(_ida_idp.reg_info_t, '__str__', lambda self: f".name: {_ida_idp.get_reg_name(self.reg, self.size)}, .size: 0x{self.size:x}, .register_index: {self.reg}, .value: " + (_hex_str_if_int(_register(self)) if debugger_is_active() else "<value only available when debugger is active>") + "\n")
-setattr(_ida_idp.reg_info_t, '__repr__', __repr__type_str)
-setattr(_ida_idp.reg_info_t, '__len__', lambda self: self.size)
-setattr(_ida_idp.reg_info_t, 'name', property(fget=lambda self: _ida_idp.get_reg_name(self.reg, self.size)))
-setattr(_ida_idp.reg_info_t, 'register_index', _ida_idp.reg_info_t.reg)
-setattr(_ida_idp.reg_info_t, 'value', property(fget=_register, fset=_register)) # type: ignore[arg-type]
-setattr(_ida_idp.reg_info_t, '__add__', lambda self, other: eval_expression(self) + eval_expression(other)) # type: ignore[operator]
-setattr(_ida_idp.reg_info_t, '__radd__', _ida_idp.reg_info_t.__add__)
-setattr(_ida_idp.reg_info_t, '__iadd__', lambda self, other: self if _register(arg_register=self, arg_set_value=eval_expression(self) + eval_expression(other)) else self) # type: ignore[operator]
-setattr(_ida_idp.reg_info_t, '__sub__', lambda self, other: eval_expression(self) - eval_expression(other)) # type: ignore[operator]
-setattr(_ida_idp.reg_info_t, '__rsub__', lambda other, self: _ida_idp.reg_info_t.__sub__(self, other))
-setattr(_ida_idp.reg_info_t, '__isub__', lambda self, other: self if _register(arg_register=self, arg_set_value=eval_expression(self) - eval_expression(other)) else self) # type: ignore[operator]
-setattr(_ida_idp.reg_info_t, '__eq__', lambda self, other: self is other or self.name == other)
-setattr(_ida_hexrays.carg_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{self.type} {str(self)}")
-setattr(_ida_hexrays.carg_t, 'name', property(fget=str)) # TODO: Bad idea?
-setattr(_ida_hexrays.carglist_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{' '.join([chr(0x0D)+repr(arg)+chr(0x0D) for arg in self])}")
-setattr(_ida_hexrays.cfuncptr_t, '__str__', lambda self: str(self.get_pseudocode())) # Print THIS object, don't decompile again (the strvec_t.__str__ is set below)
-setattr(_ida_hexrays.cfuncptr_t, '__repr__', lambda self: __repr__type_address_str(self)[0:200])
-setattr(_ida_hexrays.cfuncptr_t, 'address', property(fget=address))
-setattr(_ida_hexrays.cfuncptr_t, 'prototype', property(fget=function_prototype))
-setattr(_ida_hexrays.cfuncptr_t, 'return_type', property(fget=lambda self: self.type.get_rettype(), doc='The tinfo_t of the return value'))
-setattr(_ida_hexrays.cfuncptr_t, 'name', property(fget=name, fset=lambda self, new_name: name(self, arg_set_name=new_name, arg_force=True))) # type: ignore[union-attr, arg-type]
-setattr(_ida_hexrays.cfuncptr_t, 'local_variables', property(fget=lambda self: {var.name: var for var in self.lvars}))
-setattr(_ida_hexrays.cfuncptr_t, 'calls', property(fget=decompiler_calls))
-setattr(_ida_hexrays.cfuncptr_t, 'is_lumina_name', property(fget=function_is_lumina_name))
-setattr(_ida_hexrays.citem_t, '__str__', lambda self: f"{_ida_lines.tag_remove(self.print1(None))}")
-setattr(_ida_hexrays.citem_t, '__repr__', __repr__type_address_str)
-setattr(_ida_hexrays.cexpr_t, '__repr__', lambda self: f"{type(self)} with opname: '{self.opname}' and to_specific_type.opname: '{self.to_specific_type.opname}' @ 0x{address(self):x} which looks like:\n{str(self)}"  ) # TODO: address of cexpr_t is not OK according to the type hints
-setattr(_ida_hexrays.cexpr_t, 'arguments', property(fget=lambda self: self._get_a() if self.opname == 'call' else None)) # Used for cot_call
-setattr(_ida_hexrays.cexpr_t, 'first_operand', _ida_hexrays.cexpr_t.x) # Better name
-setattr(_ida_hexrays.cexpr_t, 'second_operand', _ida_hexrays.cexpr_t.y) # Better name
-setattr(_ida_hexrays.cexpr_t, 'third_operand', _ida_hexrays.cexpr_t.z) # Better name
-setattr(_ida_hexrays.cexpr_t, 'variable', _ida_hexrays.cexpr_t.v) # Better name. used for cot_var
-setattr(_ida_hexrays.cexpr_t.v, '__doc__', 'Short name for variable. Only used for cot_var')
-setattr(_ida_hexrays.cexpr_t, 'value', property(fget=lambda self: self.numval() if self.opname == 'num' else None)) # Used for cot_num
-setattr(_ida_hexrays.cexpr_t, 'float', _ida_hexrays.cexpr_t.fpc) # Used for cot_fnum
-setattr(_ida_hexrays.cexpr_t, 'target_ea', property(fget=lambda self: self.x.obj_ea if self.opname == 'call' else None)) # Used for cot_obj. Use this to get the address that the call is calling to
-setattr(_ida_hexrays.cexpr_t, 'member_offset', _ida_hexrays.cexpr_t.m) # Used for cot_memptr and cot_memref
-setattr(_ida_hexrays.cinsn_t, '__repr__', lambda self: f"{type(self)} with opname: '{self.opname}' and to_specific_type.opname: '{self.to_specific_type.opname}' @ 0x{address(self):x} which looks like:\n{str(self)}"  ) # "cinsn_t represents statements supported by Hex-Rays (cit_for, cit_if, cit_return etc...)" source: https://hex-rays.com/blog/hex-rays-decompiler-primer
-setattr(_ida_hexrays.casm_t, '__repr__', lambda self: "__asm { \n" + "\n".join(["\t" + disassemble(x, arg_show_size=False, arg_show_bytes=False) for x in self]) + "\n}") # type: ignore[operator]
-setattr(_ida_hexrays.lvar_t, '__str__', lambda self: f"{str(self.type()).replace(' *','*')} {str(self.name)}")
-setattr(_ida_hexrays.lvar_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{str(self)}")
-setattr(_ida_hexrays.lvar_t, '__len__', lambda self: self.type().size)
-setattr(_ida_hexrays.lvar_t, 'register', property(fget=lambda self: registers._as_dict[_ida_idp.get_reg_name(_ida_hexrays.mreg2reg(self.get_reg1(), len(self)), len(self))] if self.is_reg1() else None))
-setattr(_ida_hexrays.lvars_t, "__repr__", lambda self: "[" +  "\n".join([repr(var) for var in self]) + "]")
-setattr(_ida_hexrays.var_ref_t, '__str__', lambda self: str(self.getv())) # self.getv() returns a _ida_hexrays.lvar_t
-setattr(_ida_hexrays.var_ref_t, '__repr__', __repr__type_str)
-setattr(_ida_hexrays.vdui_t, '__str__', lambda self: f"Window title: {TWidget(self.ct).window_title()}, function name: {name(self.cfunc)}")
-setattr(_ida_hexrays.vdui_t, '__repr__', __repr__type_str)
-setattr(_ida_hexrays.ctree_items_t, '__repr__', lambda self: f"{type(self)} which looks like:\n[{', '.join([str(citem) for citem in self])}]")
-setattr(_ida_idd.Appcall_callable__, '__str__', lambda self: str(function(self)))
-setattr(_ida_idd.Appcall_callable__, '__repr__', __repr__type_address_str)
-setattr(_ida_typeinf.enum_member_t, '__str__', lambda self: f"{self.name} = 0x{self.value:x}, // {self.value}")
-setattr(_ida_typeinf.enum_member_t, '__repr__', __repr__type_str)
-setattr(_ida_typeinf.enum_type_data_t, '__repr__', lambda self: "\n".join([str(member) for member in self]))
-setattr(_ida_dbg.bpt_t, '__str__', lambda self: f"ea: 0x{self.ea:x}, is hardware breakpoint (is_hwbpt): {self.is_hwbpt()}, enabled: {self.enabled()}, eval_lang: {self.elang}, condition: {self.condition}")
-setattr(_ida_dbg.bpt_t, '__repr__', __repr__type_address_str)
-setattr(_ida_dbg.bpt_t.elang, "__doc__", "The language used to evaluate what to do when we hit this breakpoint. Allowed values are IDC or Python")
-setattr(_ida_idd.modinfo_t, '__str__', lambda self: f"name: {self.name}, base: 0x{self.base:x}, size: 0x{self.size:x}, rebase_to: 0x{self.rebase_to:x}")
-setattr(_ida_idd.modinfo_t, '__repr__', __repr__type_address_str)
-setattr(_ida_idd.modinfo_t, '__add__', lambda self, other: eval_expression(self) + eval_expression(other)) # type: ignore[operator]
-setattr(_ida_range.range_t, '__str__', lambda self: f"start_ea: {_hex_str_if_int(self.start_ea)} --> end_ea: {_hex_str_if_int(self.end_ea)}")
-setattr(_ida_range.range_t, '__repr__', __repr__type_address_str)
-setattr(_ida_idd.process_info_t, '__repr__', lambda self: f"process name: {self.name}, PID: 0x{self.pid:x} ({self.pid})")
-setattr(_idautils.Strings.StringItem, "__repr__", __repr__type_address_str)
-setattr(_idautils.Strings.StringItem, "encoding", property(fget=lambda self: _idaapi_encoding_from_strtype(self.strtype)))
+_patch_ida_class(_ida_ua.op_t, 'register', property(fget=_op_t_to_register))
+_patch_ida_class(_ida_ua.op_t, 'name', property(fget=name))
+_patch_ida_class(_ida_ua.op_t, '__len__', lambda self: _G_DATA_TYPE_SIZES_IN_BYTES[self.dtype])
+_patch_ida_class(_ida_ua.op_t, 'as_dict', property(fget=_operand_parser))
+_patch_ida_class(_ida_ua.op_t, '__eq__', lambda self, other: isinstance(other, _ida_ua.op_t) and self.type == other.type and self.dtype == other.dtype and self.value == other.value and self.value64 == other.value64 and self.specflag1 == other.specflag1 and self.specflag2 == other.specflag2 and self.reg == other.reg and self.addr == other.addr)
+_patch_ida_class(_ida_idp.reg_info_t, '__str__', lambda self: f".name: {_ida_idp.get_reg_name(self.reg, self.size)}, .size: 0x{self.size:x}, .register_index: {self.reg}, .value: " + (_hex_str_if_int(_register(self)) if debugger_is_active() else "<value only available when debugger is active>") + "\n")
+_patch_ida_class(_ida_idp.reg_info_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_idp.reg_info_t, '__len__', lambda self: self.size)
+_patch_ida_class(_ida_idp.reg_info_t, 'name', property(fget=lambda self: _ida_idp.get_reg_name(self.reg, self.size)))
+_patch_ida_class(_ida_idp.reg_info_t, 'register_index', _ida_idp.reg_info_t.reg)
+_patch_ida_class(_ida_idp.reg_info_t, 'value', property(fget=_register, fset=_register)) # type: ignore[arg-type]
+_patch_ida_class(_ida_idp.reg_info_t, '__add__', lambda self, other: eval_expression(self) + eval_expression(other)) # type: ignore[operator]
+_patch_ida_class(_ida_idp.reg_info_t, '__radd__', lambda self, other: eval_expression(other) + eval_expression(self)) # type: ignore[operator] # OBS! Not "_ida_idp.reg_info_t.__add__" as the argument: that is evaluated right here, and in the plugin copy (where nothing is patched) it raises AttributeError if the real module is not loaded yet
+_patch_ida_class(_ida_idp.reg_info_t, '__iadd__', lambda self, other: self if _register(arg_register=self, arg_set_value=eval_expression(self) + eval_expression(other)) else self) # type: ignore[operator]
+_patch_ida_class(_ida_idp.reg_info_t, '__sub__', lambda self, other: eval_expression(self) - eval_expression(other)) # type: ignore[operator]
+_patch_ida_class(_ida_idp.reg_info_t, '__rsub__', lambda other, self: _ida_idp.reg_info_t.__sub__(self, other))
+_patch_ida_class(_ida_idp.reg_info_t, '__isub__', lambda self, other: self if _register(arg_register=self, arg_set_value=eval_expression(self) - eval_expression(other)) else self) # type: ignore[operator]
+_patch_ida_class(_ida_idp.reg_info_t, '__eq__', lambda self, other: self is other or self.name == other)
+_patch_ida_class(_ida_hexrays.carg_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{self.type} {str(self)}")
+_patch_ida_class(_ida_hexrays.carg_t, 'name', property(fget=str)) # TODO: Bad idea?
+_patch_ida_class(_ida_hexrays.carglist_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{' '.join([chr(0x0D)+repr(arg)+chr(0x0D) for arg in self])}")
+_patch_ida_class(_ida_hexrays.cfuncptr_t, '__str__', lambda self: str(self.get_pseudocode())) # Print THIS object, don't decompile again (the strvec_t.__str__ is set below)
+_patch_ida_class(_ida_hexrays.cfuncptr_t, '__repr__', lambda self: __repr__type_address_str(self)[0:200])
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'address', property(fget=address))
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'prototype', property(fget=function_prototype))
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'return_type', property(fget=lambda self: self.type.get_rettype(), doc='The tinfo_t of the return value'))
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'name', property(fget=name, fset=lambda self, new_name: name(self, arg_set_name=new_name, arg_force=True))) # type: ignore[union-attr, arg-type]
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'local_variables', property(fget=lambda self: {var.name: var for var in self.lvars}))
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'calls', property(fget=decompiler_calls))
+_patch_ida_class(_ida_hexrays.cfuncptr_t, 'is_lumina_name', property(fget=function_is_lumina_name))
+_patch_ida_class(_ida_hexrays.citem_t, '__str__', lambda self: f"{_ida_lines.tag_remove(self.print1(None))}")
+_patch_ida_class(_ida_hexrays.citem_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_hexrays.cexpr_t, '__repr__', lambda self: f"{type(self)} with opname: '{self.opname}' and to_specific_type.opname: '{self.to_specific_type.opname}' @ 0x{address(self):x} which looks like:\n{str(self)}"  ) # TODO: address of cexpr_t is not OK according to the type hints
+_patch_ida_class(_ida_hexrays.cexpr_t, 'arguments', property(fget=lambda self: self._get_a() if self.opname == 'call' else None)) # Used for cot_call
+_patch_ida_class(_ida_hexrays.cexpr_t, 'first_operand', _ida_hexrays.cexpr_t.x) # Better name
+_patch_ida_class(_ida_hexrays.cexpr_t, 'second_operand', _ida_hexrays.cexpr_t.y) # Better name
+_patch_ida_class(_ida_hexrays.cexpr_t, 'third_operand', _ida_hexrays.cexpr_t.z) # Better name
+_patch_ida_class(_ida_hexrays.cexpr_t, 'variable', _ida_hexrays.cexpr_t.v) # Better name. used for cot_var
+_patch_ida_class(_ida_hexrays.cexpr_t.v, '__doc__', 'Short name for variable. Only used for cot_var')
+_patch_ida_class(_ida_hexrays.cexpr_t, 'value', property(fget=lambda self: self.numval() if self.opname == 'num' else None)) # Used for cot_num
+_patch_ida_class(_ida_hexrays.cexpr_t, 'float', _ida_hexrays.cexpr_t.fpc) # Used for cot_fnum
+_patch_ida_class(_ida_hexrays.cexpr_t, 'target_ea', property(fget=lambda self: self.x.obj_ea if self.opname == 'call' else None)) # Used for cot_obj. Use this to get the address that the call is calling to
+_patch_ida_class(_ida_hexrays.cexpr_t, 'member_offset', _ida_hexrays.cexpr_t.m) # Used for cot_memptr and cot_memref
+_patch_ida_class(_ida_hexrays.cinsn_t, '__repr__', lambda self: f"{type(self)} with opname: '{self.opname}' and to_specific_type.opname: '{self.to_specific_type.opname}' @ 0x{address(self):x} which looks like:\n{str(self)}"  ) # "cinsn_t represents statements supported by Hex-Rays (cit_for, cit_if, cit_return etc...)" source: https://hex-rays.com/blog/hex-rays-decompiler-primer
+_patch_ida_class(_ida_hexrays.casm_t, '__repr__', lambda self: "__asm { \n" + "\n".join(["\t" + disassemble(x, arg_show_size=False, arg_show_bytes=False) for x in self]) + "\n}") # type: ignore[operator]
+_patch_ida_class(_ida_hexrays.lvar_t, '__str__', lambda self: f"{str(self.type()).replace(' *','*')} {str(self.name)}")
+_patch_ida_class(_ida_hexrays.lvar_t, '__repr__', lambda self: f"{type(self)} which looks like:\n{str(self)}")
+_patch_ida_class(_ida_hexrays.lvar_t, '__len__', lambda self: self.type().size)
+_patch_ida_class(_ida_hexrays.lvar_t, 'register', property(fget=lambda self: registers._as_dict[_ida_idp.get_reg_name(_ida_hexrays.mreg2reg(self.get_reg1(), len(self)), len(self))] if self.is_reg1() else None))
+_patch_ida_class(_ida_hexrays.lvars_t, "__repr__", lambda self: "[" +  "\n".join([repr(var) for var in self]) + "]")
+_patch_ida_class(_ida_hexrays.var_ref_t, '__str__', lambda self: str(self.getv())) # self.getv() returns a _ida_hexrays.lvar_t
+_patch_ida_class(_ida_hexrays.var_ref_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_hexrays.vdui_t, '__str__', lambda self: f"Window title: {TWidget(self.ct).window_title()}, function name: {name(self.cfunc)}")
+_patch_ida_class(_ida_hexrays.vdui_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_hexrays.ctree_items_t, '__repr__', lambda self: f"{type(self)} which looks like:\n[{', '.join([str(citem) for citem in self])}]")
+_patch_ida_class(_ida_idd.Appcall_callable__, '__str__', lambda self: str(function(self)))
+_patch_ida_class(_ida_idd.Appcall_callable__, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_typeinf.enum_member_t, '__str__', lambda self: f"{self.name} = 0x{self.value:x}, // {self.value}")
+_patch_ida_class(_ida_typeinf.enum_member_t, '__repr__', __repr__type_str)
+_patch_ida_class(_ida_typeinf.enum_type_data_t, '__repr__', lambda self: "\n".join([str(member) for member in self]))
+_patch_ida_class(_ida_dbg.bpt_t, '__str__', lambda self: f"ea: 0x{self.ea:x}, is hardware breakpoint (is_hwbpt): {self.is_hwbpt()}, enabled: {self.enabled()}, eval_lang: {self.elang}, condition: {self.condition}")
+_patch_ida_class(_ida_dbg.bpt_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_dbg.bpt_t.elang, "__doc__", "The language used to evaluate what to do when we hit this breakpoint. Allowed values are IDC or Python")
+_patch_ida_class(_ida_idd.modinfo_t, '__str__', lambda self: f"name: {self.name}, base: 0x{self.base:x}, size: 0x{self.size:x}, rebase_to: 0x{self.rebase_to:x}")
+_patch_ida_class(_ida_idd.modinfo_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_idd.modinfo_t, '__add__', lambda self, other: eval_expression(self) + eval_expression(other)) # type: ignore[operator]
+_patch_ida_class(_ida_range.range_t, '__str__', lambda self: f"start_ea: {_hex_str_if_int(self.start_ea)} --> end_ea: {_hex_str_if_int(self.end_ea)}")
+_patch_ida_class(_ida_range.range_t, '__repr__', __repr__type_address_str)
+_patch_ida_class(_ida_idd.process_info_t, '__repr__', lambda self: f"process name: {self.name}, PID: 0x{self.pid:x} ({self.pid})")
+_patch_ida_class(_idautils.Strings.StringItem, "__repr__", __repr__type_address_str)
+_patch_ida_class(_idautils.Strings.StringItem, "encoding", property(fget=lambda self: _idaapi_encoding_from_strtype(self.strtype)))
+_patch_ida_class(_idautils.Strings.StringItem, "synthetic_provider", property(fget=_string_item_synthetic_provider, doc="Who made this synthetic string (text not in the bytes at ea), None for a normal string"))
 
 
 # TESTS ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ TESTS
@@ -7220,6 +7428,8 @@ def _test_decompiler(arg_debug: bool = False) -> bool:
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_licence(arg_debug: bool = False) -> bool:
     ''' Tests: licence '''
+    
+    # TODO: Add code for the new ida_license module
     l_licence = ida_license_info(arg_delete_user_info_from_IDB=False)
     log_print(f"licence: {l_licence}", arg_debug)
     return l_licence is not None
@@ -7375,7 +7585,20 @@ def _test_instruction(arg_debug: bool = False) -> bool:
         return False
 
     log_print(str(l_first_instruction_again), arg_debug)
-    return str(l_ins) == str(l_first_instruction_again)
+    res = _test_check("previous_instruction of next_instruction is the first instruction", str(l_ins) == str(l_first_instruction_again), str(l_first_instruction_again), arg_debug)
+    res &= _test_check("next_instruction is the instruction directly after (also after a 1 byte instruction)", l_next_ins.ea == l_ins.ea + l_ins.size, f"0x{l_next_ins.ea:x}, expected 0x{l_ins.ea + l_ins.size:x}", arg_debug)
+
+    # A 1 byte instruction: instruction_after() used to skip the instruction after it. Search this function for one
+    l_function = function(l_ins.ea, arg_debug=arg_debug)
+    if l_function is not None:
+        for l_ea in l_function.code_items():
+            l_small_ins = instruction(l_ea, arg_debug=arg_debug)
+            if l_small_ins is None or l_small_ins.size != 1 or l_ea + 1 >= l_function.end_ea:
+                continue
+            l_after = instruction_after(l_ea, arg_debug=arg_debug)
+            res &= _test_check("instruction_after() a 1 byte instruction", l_after is not None and l_after.ea == l_ea + 1, f"0x{l_after.ea:x}, expected 0x{l_ea + 1:x}" if l_after is not None else None, arg_debug)
+            break
+    return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_bug_report(arg_debug: bool = False) -> bool:
@@ -7429,7 +7652,8 @@ def _test_ida_domain(arg_debug: bool = False) -> bool:
     res &= l_db.bytes.get_bytes_at(l_db.base_address, 0x10) == read_bytes(input_file.imagebase, 0x10)
     res &= l_db.md5 == input_file.md5
     # l_db.microcode.get_text()
-    l_db.close()
+    # OBS! No l_db.close(): Database.open() without a path only gives a handle to the database that is already open.
+    # In the GUI close() just logs an error, in idalib it would close the database under the rest of the tests
     log_print(f"test_ida_domain: {res}", arg_debug)
     return res
 
@@ -7772,6 +7996,9 @@ def _test_get_type_and_parse_decl(arg_debug: bool = False) -> bool:
     res &= _test_check("get_type('void *').get_size() == pointer_size()", l_pointer is not None and l_pointer.get_size() == pointer_size(arg_debug=arg_debug), l_pointer, arg_debug)
     res &= _test_check("pointer_size() == bits // 8", pointer_size(arg_debug=arg_debug) == input_file.bits // 8, pointer_size(arg_debug=arg_debug), arg_debug)
     # In notepad.exe the name CreateFileW is the import table slot, so the type there is a function POINTER. Both are OK.
+    
+    l_CreateFileW_type = "HANDLE __stdcall(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)"
+    res &= set_type("CreateFileW", l_CreateFileW_type)
     l_from_til = get_type("CreateFileW", arg_debug=arg_debug)
     res &= _test_check("get_type('CreateFileW') is a function or function pointer", l_from_til is not None and (l_from_til.is_func() or l_from_til.is_funcptr()), l_from_til, arg_debug)
     # Function prototypes without a function name, the clang parser (default from IDA 9.5) can not parse these as they are, see _fix_c_type()
@@ -7888,6 +8115,14 @@ def _test_strings_and_xrefs(arg_debug: bool = False) -> bool:
         res &= _test_check("StringItem.encoding", bool(l_encoding), l_encoding, arg_debug)
         l_text = string(l_string_item, arg_debug=arg_debug)
         res &= _test_check("string(StringItem) == str(StringItem)", l_text is not None and l_text == str(l_string_item).rstrip('\x00'), l_text, arg_debug)
+    l_providers = [l_item.synthetic_provider for l_item in l_strings] # Property added by community_base
+    res &= _test_check("StringItem.synthetic_provider is None or a str", all(l_provider is None or isinstance(l_provider, str) for l_provider in l_providers), l_providers, arg_debug)
+    for l_item in l_strings:
+        if l_item.synthetic_provider is None: continue
+        l_text = string(l_item, arg_debug=arg_debug)
+        res &= _test_check(f"string(synthetic StringItem at 0x{l_item.ea:x}) == str(StringItem)", l_text == str(l_item).rstrip('\x00'), l_text, arg_debug)
+    l_no_synthetic = strings(arg_only_first=10, arg_include_synthetic=False, arg_debug=arg_debug)
+    res &= _test_check("strings(arg_include_synthetic=False) has no synthetic strings", all(l_item.synthetic_provider is None for l_item in l_no_synthetic), len(l_no_synthetic), arg_debug)
 
     l_import_with_xrefs: int = _ida_idaapi.BADADDR
     for l_functions_in_module in imports(arg_debug=arg_debug).values():
@@ -8171,6 +8406,7 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
 
     return res
 
+
 # EXPERIMENTAL ---------------------------------------------------------------------------------------------------------------------------------------------------------- EXPERIMENTAL
 
 
@@ -8356,15 +8592,16 @@ _G_HOTKEY_COPY_SELECTED_BYTES_AS_HEX_TEXT = _hotkey_str_fixer('Shift + C') # Sel
 _G_HOTKEY_COPY_CURRENT_ADDRESS = _hotkey_str_fixer('Alt + Ins') # Copy the current address as hex text into the clipboard. Same shortcut as x64dbg.
 _G_HOTKEY_SMART_DELETE_BYTES = _hotkey_str_fixer('Del') # Pressing delete on code turns it into NOP (0x90) if it's already NOP (or data) then write 0x00
 
+# TODO: If the user press DEL on bytes that are only 0x00, then maybe we do a restore on them? So the del button becomes a carousel as IDA calls it when it's about data
+
 class community_base_plugmod_t(_ida_idaapi.plugmod_t):
     ''' This is the code that is actually run '''
 
     @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
     def __init__(self) -> None:
-        ''' Registers the 4 hotkeys (actions). Existing actions with the same names are unregistered first so a reload works. Needs Qt (the GUI) '''
-        if not _G_QT_IS_AVAILABLE:
-            log_print(f"{_G_PLUGIN_NAME} found no QT and will not add any hotkeys", arg_type="WARNING")
-            return
+        ''' Registers the 4 hotkeys (actions). Existing actions with the same names are unregistered first so a reload works.
+        Needs Qt (the GUI), community_base_plugin_t.init() only creates this object when Qt is available.
+        '''
         log_print(f"{_G_PLUGIN_NAME} loaded as plugin", arg_type="INFO")
 
         # ---- Hotkey: w --> Dump selected bytes to a file on disk ----------------------------------------------------------------------------------------
@@ -8518,17 +8755,21 @@ class community_base_plugin_t(_ida_idaapi.plugin_t):
 
     @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
     def init(self) -> Optional[_ida_idaapi.plugmod_t]:
-        ''' We can do checking and if we don't want to be loaded, we can return None.
-        If we want to be loaded, then we return a ida_idaapi.plugmod_t
+        ''' IDA calls this to load the plugin. Without the GUI (idalib/ida_domain or idat) there are no hotkeys to add, so the plugin is skipped.
+        The library part still works headless with "import community_base".
+
+        @return A community_base_plugmod_t() with the 4 hotkeys, or None (== PLUGIN_SKIP) when there is no GUI
         '''
+        if not _G_QT_IS_AVAILABLE:
+            log_print(f"{_G_PLUGIN_NAME}: no GUI, the plugin (hotkeys) is skipped. The library still works with: import community_base", arg_type="INFO")
+            return None # == PLUGIN_SKIP
         return community_base_plugmod_t()
 
 def PLUGIN_ENTRY() -> _ida_idaapi.plugin_t:
     ''' IDA calls this function to get the plugin object when it loads the plugin '''
-    return community_base_plugin_t()
-
-# "from community_base import *" exports everything public EXCEPT help(), which would shadow Python's builtin help(). Use community_base.help() for that one.
-__all__ = [_t_name for _t_name, _t_value in list(globals().items()) if not _t_name.startswith('_') and _t_name != 'help' and not isinstance(_t_value, ModuleType)]
+    if not _G_QT_IS_AVAILABLE: return community_base_plugin_t() # Headless: init() skips the plugin, so the self import below is not needed (it would execute this whole file one more time)
+    import community_base as _cb # This is a hackish way to have 1 real module while IDA actually loads it both when loading plugins and later when loading it with import
+    return _cb.community_base_plugin_t()
 
 if not _is_running_as_plugin():
     log_print(f"Loaded {__name__} version: {__version__} by {__author__}. This version was released {_time_since(__version__)}", arg_type="INFO")
