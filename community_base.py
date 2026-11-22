@@ -26,6 +26,7 @@ I try to have a low cognitive load. "What matters is the amount of confusion dev
 import community_base; print("\n".join([wrapper.replace("_idaapi_","") for wrapper in dir(community_base) if wrapper.startswith("_idaapi_")]))
 ```
 - Cancel scripts that take too long. You can copy the the string "abort.ida" into the clipboard and within 10 seconds, the script will stop. Check out ```_check_if_long_running_script_should_abort()``` for implementation
+- Fast execution when your script is done. All the type checks cost time, ```fast_execution(True)``` turns them off at runtime (or set the environment variable COMMUNITY_BASE_FAST_EXECUTION=1 before IDA starts)
 - Easy bug reporting. See the function ```bug_report()```
 - Get some good links to helpful resources. See the function ```links()```
 - when developing, it's nice to have a fast and easy way to reload the script and all it's dependencies, see the function ```reload_python_module()```
@@ -76,7 +77,7 @@ Read more: <https://hex-rays.com/blog/igors-tip-of-the-week-33-idas-user-directo
 
 from __future__ import annotations
 
-__version__ = "2026-11-11 00:45:38"
+__version__ = "2026-11-22 01:21:00"
 __author__ = "Harding"
 __description__ = __doc__
 __copyright__ = "Copyright 2026"
@@ -106,12 +107,12 @@ import importlib.util as _importlib_util
 import importlib.machinery as _importlib_machinery
 import json as _json # TODO: Change to json5?
 from typing import Union, List, Dict, Tuple, Any, Optional, Callable, Set, Literal, TYPE_CHECKING
-from types import ModuleType
+from types import ModuleType, FrameType
 from dataclasses import dataclass as _dataclass
 import inspect as _inspect
 _missing_imports: List[str] = []
 try:
-    from pydantic import validate_call
+    from pydantic import validate_call as _pydantic_validate_call # Wrapped by validate_call() below so the validation can be turned off with fast_execution()
     from pydantic.functional_validators import PlainValidator as _PlainValidator
     from typing_extensions import Annotated as _Annotated # typing.Annotated is Python 3.9+, pydantic itself depends on typing_extensions
 except ImportError:
@@ -133,6 +134,40 @@ if _missing_imports:
     l_error_msg = f"{__file__}: You are missing some needed modules, you can run the following to install them: pip install {' '.join(_missing_imports)}"
     print(l_error_msg)
     raise ImportError(l_error_msg)
+
+# Fast execution = no pydantic validation of arguments and return values. Default is OFF (full validation, clear errors).
+# Start value from the environment variable COMMUNITY_BASE_FAST_EXECUTION=1, change it at any time with fast_execution().
+# globals().get() keeps the value over a reload_python_module() (importlib.reload() runs this file again in the same module object)
+_G_FAST_EXECUTION: bool = globals().get("_G_FAST_EXECUTION", _os.environ.get("COMMUNITY_BASE_FAST_EXECUTION", "0") == "1")
+
+_g_validated_to_raw: Dict[Callable, Callable] = {} # validated function --> raw function, for fast_execution() to swap them
+_g_raw_to_validated: Dict[Callable, Callable] = {} # raw function --> validated function
+
+if TYPE_CHECKING:
+    from pydantic import validate_call # mypy sees the real pydantic signature
+else:
+    def validate_call(arg_function: Optional[Callable] = None, **arg_kwargs: Any) -> Any:
+        ''' Drop-in replacement for pydantic.validate_call that can be turned off at runtime with fast_execution().
+        Handles both @validate_call and @validate_call(config={...}).
+        Returns pydantic's validated function itself (no extra wrapper, so no extra cost) and remembers the raw function,
+        fast_execution() then swaps the module globals, the class attributes and the patched IDA classes between the two.
+
+        OBS! Functions defined inside other functions ("<locals>" in __qualname__) are created again on every call, they are not remembered
+        and get the mode that is active when they are created.
+
+        @param arg_function The decorated function when used as @validate_call, None when used as @validate_call(...)
+        @param arg_kwargs Passed on to pydantic.validate_call (config, validate_return ...)
+        @return The validated function, or the raw function if fast execution is on
+        '''
+        def _decorator(arg_inner_function: Callable) -> Callable:
+            l_validated: Callable = _pydantic_validate_call(**arg_kwargs)(arg_inner_function)
+            if "<locals>" not in getattr(arg_inner_function, "__qualname__", ""): # Local functions are recreated on every call, remembering them would leak memory
+                _g_validated_to_raw[l_validated] = arg_inner_function
+                _g_raw_to_validated[arg_inner_function] = l_validated
+            return arg_inner_function if _G_FAST_EXECUTION else l_validated
+
+        if arg_function is not None: return _decorator(arg_function) # Used as @validate_call without parentheses
+        return _decorator
 
 import ida_allins as _ida_allins # type: ignore[import-untyped]
 import ida_auto as _ida_auto # type: ignore[import-untyped]
@@ -481,6 +516,25 @@ def _check_if_long_running_script_should_abort() -> None:
 
     return
 
+_G_PYDANTIC_PATH_PART: str = _os.sep + "pydantic" + _os.sep
+
+def _log_stacklevel() -> int:
+    ''' Internal function, only to be called from log_print(). No @validate_call on purpose, that would add frames.
+    Finds the stacklevel for logging so the log line shows the function that called log_print(), not a wrapper in between.
+    The wrappers are pydantic's frames, they are there when validation is on and gone with fast_execution(True).
+
+    @return The stacklevel to give the logger, 1 == log_print() itself
+    '''
+    l_level: int = 2 # 2 == the frame right above log_print()
+    l_frame: Optional[FrameType] = _sys._getframe(2) # 0 == this function, 1 == log_print(), 2 == whoever called log_print() (maybe a wrapper)
+    while l_frame is not None: # At most a few frames, no log_print() needed (and it can't be called from here)
+        l_code = l_frame.f_code
+        l_is_wrapper: bool = _G_PYDANTIC_PATH_PART in l_code.co_filename
+        if not l_is_wrapper: return l_level
+        l_frame = l_frame.f_back
+        l_level += 1
+    return 2
+
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def log_print(arg_string: Union[str, int, bool], arg_actually_print: bool = True, arg_type: str = "DEBUG") -> None:
     ''' Log a message to both IDA's output window and the Jupyter console (if one is connected).
@@ -493,20 +547,103 @@ def log_print(arg_string: Union[str, int, bool], arg_actually_print: bool = True
     '''
     _check_if_long_running_script_should_abort()
     if arg_actually_print or _G_LOG_EVERYTHING:
+        l_stacklevel: int = _log_stacklevel() # Skips the validation wrappers so the log shows the real caller, with and without fast_execution()
         arg_type = arg_type.upper()
         if arg_type == "DEBUG":
-            _g_logger.debug(arg_string, stacklevel=4)
+            _g_logger.debug(arg_string, stacklevel=l_stacklevel)
         elif arg_type == "INFO":
-            _g_logger.info(arg_string, stacklevel=4)
+            _g_logger.info(arg_string, stacklevel=l_stacklevel)
         elif arg_type == "WARNING":
-            _g_logger.warning(arg_string, stacklevel=4)
+            _g_logger.warning(arg_string, stacklevel=l_stacklevel)
         elif arg_type == "ERROR":
-            _g_logger.error(arg_string, stacklevel=4)
+            _g_logger.error(arg_string, stacklevel=l_stacklevel)
         elif arg_type == "CRITICAL":
-            _g_logger.critical(arg_string, stacklevel=4)
+            _g_logger.critical(arg_string, stacklevel=l_stacklevel)
         else:
-            _g_logger.debug(arg_string, stacklevel=4)
+            _g_logger.debug(arg_string, stacklevel=l_stacklevel)
     return
+
+def fast_execution(arg_enable: bool) -> None:
+    ''' Turn pydantic validation of all arguments and return values off (fast) or on (default, clear errors). Works at any time, also after import.
+    Develop and test with validation, then turn on fast execution for a script that is known to work.
+    The switch is global: it affects every script and plugin that uses community_base in this IDA, also the hotkeys.
+    The start value comes from the environment variable COMMUNITY_BASE_FAST_EXECUTION=1
+
+    e.g. import community_base as cb; cb.fast_execution(True)
+
+    OBS! This function has no @validate_call on purpose, it must work the same in both modes.
+    OBS! arg_enable is required on purpose: cb.fast_execution() without an argument must not look like it turned something on.
+
+    @param arg_enable True = no validation (fast), False = validation (the default when community_base is loaded)
+    @return None
+    '''
+    global _G_FAST_EXECUTION
+    if not isinstance(arg_enable, bool): raise TypeError(f"arg_enable must be a bool, got {type(arg_enable)}") # No pydantic here, check by hand
+    l_state_text: str = 'ON (no validation of arguments and return values)' if arg_enable else 'OFF (full validation)'
+    if arg_enable == _G_FAST_EXECUTION:
+        log_print(f"Fast execution is already {l_state_text}", arg_type="INFO")
+        return
+    l_swapped: int = _swap_validated_functions(_g_validated_to_raw if arg_enable else _g_raw_to_validated)
+    _G_FAST_EXECUTION = arg_enable
+    log_print(f"Fast execution {l_state_text}, swapped {l_swapped} references", arg_type="INFO")
+    return
+
+def _swap_validated_functions(arg_map: Dict[Callable, Callable]) -> int:
+    ''' Internal function for fast_execution(). No @validate_call on purpose, it swaps those functions.
+    Replaces every function found in arg_map with its partner in:
+    1. this module's globals (also aliases like here = current_address, they are the same object)
+    2. the attributes of the classes defined in this module (methods)
+    3. the attributes of the global objects whose class is defined in this module (e.g. the functions _g_dual_handler keeps)
+    4. the attributes that _patch_ida_class() put on IDA's classes (also fget/fset/fdel of properties)
+    Not swapped: callbacks that IDA holds (e.g. notify_when()), they keep the mode they were registered with.
+    The code inside community_base looks up the globals on every call, so all internal calls get the new functions at once.
+    References that other code saved before the swap (e.g. "from community_base import name") keep the old function, it still works but is not affected.
+
+    @param arg_map _g_validated_to_raw (turn validation off) or _g_raw_to_validated (turn it on)
+    @return Number of references that were swapped
+    '''
+    def _partner(arg_value: Any) -> Any:
+        ''' The partner of arg_value in arg_map, or None. Some objects are not hashable, they are never in the map '''
+        if not callable(arg_value): return None # Only functions are in the map, don't hash data objects
+        try:
+            return arg_map.get(arg_value)
+        except TypeError:
+            return None
+
+    def _swapped_property(arg_property: property) -> Optional[property]:
+        ''' A new property with fget/fset/fdel swapped, or None if none of them is in arg_map '''
+        l_fget, l_fset, l_fdel = (_partner(arg_property.fget), _partner(arg_property.fset), _partner(arg_property.fdel))
+        if l_fget is None and l_fset is None and l_fdel is None: return None
+        return property(fget=l_fget or arg_property.fget, fset=l_fset or arg_property.fset, fdel=l_fdel or arg_property.fdel, doc=arg_property.__doc__)
+
+    def _swap_attributes(arg_class: Any, arg_names: List[str]) -> int:
+        ''' Swaps the given attribute names in arg_class.__dict__ (not inherited ones). arg_class can also be an instance '''
+        l_count: int = 0
+        l_class_dict: Optional[Any] = getattr(arg_class, "__dict__", None) # Some patched objects have no __dict__ (e.g. a property whose __doc__ was set)
+        if l_class_dict is None: return 0
+        for l_name in arg_names:
+            l_value: Any = l_class_dict.get(l_name)
+            l_new: Any = _swapped_property(l_value) if isinstance(l_value, property) else _partner(l_value)
+            if l_new is None: continue
+            setattr(arg_class, l_name, l_new)
+            l_count += 1
+        return l_count
+
+    l_globals: Dict[str, Any] = globals()
+    l_swapped: int = 0
+    for l_name, l_value in list(l_globals.items()): # A few thousand globals, done once per switch so no log_print() needed here
+        l_new_value: Any = _partner(l_value)
+        if l_new_value is not None:
+            l_globals[l_name] = l_new_value
+            l_swapped += 1
+        if isinstance(l_value, type) and l_value.__module__ == __name__: # A class defined in this file, swap its methods
+            l_swapped += _swap_attributes(l_value, list(l_value.__dict__.keys()))
+        elif type(l_value).__module__ == __name__ and isinstance(getattr(l_value, "__dict__", None), dict): # An object of a class defined in this file, swap the functions it keeps
+            l_swapped += _swap_attributes(l_value, list(l_value.__dict__.keys()))
+
+    for l_class, l_attribute_names in _g_patched_ida_attributes.items():
+        l_swapped += _swap_attributes(l_class, list(l_attribute_names))
+    return l_swapped
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _bool(arg_user_input: BoolishType) -> bool:
@@ -6957,6 +7094,8 @@ def _instruction_is_jcc(arg_instruction: _ida_ua.insn_t) -> bool:
         return arg_instruction.itype in _conditional_jmps_x64
     return _instruction_jumps(arg_instruction) and not _bool(_ida_idp.has_insn_feature(arg_instruction.itype, _ida_idp.CF_STOP)) and not _ida_idp.is_call_insn(arg_instruction) # Jumps but can also continue to the next instruction
 
+_g_patched_ida_attributes: Dict[Any, Set[str]] = {} # IDA class --> attribute names that _patch_ida_class() set, used by fast_execution()
+
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _patch_ida_class(arg_class: Any, arg_name: str, arg_value: Any) -> None:
     ''' Internal function. setattr() on one of IDA's classes, but ONLY in the real module (import community_base), never in the plugin copy (__plugins__community_base).
@@ -6971,6 +7110,7 @@ def _patch_ida_class(arg_class: Any, arg_name: str, arg_value: Any) -> None:
     '''
     if _is_running_as_plugin(): return
     setattr(arg_class, arg_name, arg_value)
+    if callable(arg_value) or isinstance(arg_value, property): _g_patched_ida_attributes.setdefault(arg_class, set()).add(arg_name) # fast_execution() swaps these too. Not the __doc__ strings
     return
 
 _patch_ida_class(_ida_ua.insn_t, '__str__', disassemble)
@@ -7419,11 +7559,14 @@ def _test_Qt_stuff(arg_debug: bool = False) -> bool:
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_decompiler(arg_debug: bool = False) -> bool:
-    ''' Tests: decompiler '''
-    l_pseudocode = decompiler_pseudocode(registers.rip, arg_debug=arg_debug) # type: ignore [attr-defined]
-    log_print(f"pseudocode of entrypoint: {l_pseudocode}", arg_debug)
-    res = len(l_pseudocode) > 10 and not l_pseudocode.startswith("<<<")
-    return res
+    ''' Tests: decompiler. Works with and without a debugger, see _test_code_address() '''
+    l_code_ea: Optional[int] = _test_code_address(arg_debug=arg_debug)
+    if l_code_ea is None:
+        log_print("No code in the IDB to test on", arg_type="ERROR")
+        return False
+    l_pseudocode = decompiler_pseudocode(l_code_ea, arg_debug=arg_debug)
+    log_print(f"pseudocode of 0x{l_code_ea:x}: {l_pseudocode}", arg_debug)
+    return _test_check(f"decompiler_pseudocode(0x{l_code_ea:x}) gives pseudocode", len(l_pseudocode) > 10 and not l_pseudocode.startswith("<<<"), l_pseudocode[:100], arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_licence(arg_debug: bool = False) -> bool:
@@ -7443,9 +7586,12 @@ def _test_decompiler_comments(arg_debug: bool = False) -> bool:
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_relative_virtual_address(arg_debug: bool = False) -> bool:
-    ''' Tests: relative_virtual_address. Requires a running process in a Windows system. '''
+    ''' Tests: relative_virtual_address. The part with arg_from_DLL_base=True requires a running process in a Windows system, it is skipped without one. '''
     l_rva_of_ep = relative_virtual_address(input_file.entry_point, arg_from_DLL_base=False, arg_debug=arg_debug)
-    log_print(f"relative_virtual_address of entry point: {l_rva_of_ep}", arg_debug)
+    res = _test_check("relative_virtual_address(entry point) == entry point - imagebase", l_rva_of_ep == input_file.entry_point - input_file.imagebase, l_rva_of_ep, arg_debug)
+    if not (debugger_is_active() and process_is_suspended()):
+        log_print("No suspended debugged process, skipping the arg_from_DLL_base=True part", arg_debug, arg_type="WARNING")
+        return res
 
     l_API_to_test = "kernel32_GetProcAddress"
     l_rva_of_GetProcAddress = relative_virtual_address(l_API_to_test, arg_from_DLL_base=True, arg_debug=arg_debug)
@@ -7458,7 +7604,8 @@ def _test_relative_virtual_address(arg_debug: bool = False) -> bool:
         log_print(f"Could not find any module at {_hex_str_if_int(l_API_to_test)}", arg_type="ERROR")
         return False
 
-    return name(l_module.base + l_rva_of_GetProcAddress, arg_debug=arg_debug) == l_API_to_test
+    res &= _test_check(f"relative_virtual_address('{l_API_to_test}', arg_from_DLL_base=True) + module base is {l_API_to_test} again", name(l_module.base + l_rva_of_GetProcAddress, arg_debug=arg_debug) == l_API_to_test, l_rva_of_GetProcAddress, arg_debug)
+    return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_convert_to_usercall(arg_debug: bool = False) -> bool:
@@ -7565,39 +7712,72 @@ def _test_imports_and_exports(arg_debug: bool = False) -> bool:
     return len(l_imports) >= 1 and len(l_exports) >= 1
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
-def _test_instruction(arg_debug: bool = False) -> bool:
-    ''' Test to decode bytes into an instruction '''
+def _test_code_address(arg_debug: bool = False) -> Optional[int]:
+    ''' Internal function for the tests. An address that is guaranteed to be code, also without a debugger (e.g. idalib).
+    1. RIP/EIP if the debugger is active (the classic test setup: stopped at WinMain)
+    2. The entry point of the file, IDA always makes code there
+    3. The start of the first function in the IDB (e.g. a DLL without an entry point)
 
-    l_ins = instruction(address("rip"))
+    @return The address, or None if the IDB has no code at all
+    '''
+    if debugger_is_active():
+        l_ip: int = address("rip" if ida_is_64bit() else "eip", arg_supress_error=True, arg_debug=arg_debug)
+        if l_ip != _ida_idaapi.BADADDR and is_code(l_ip, arg_debug=arg_debug): return l_ip
+        log_print("The debugger is active but the instruction pointer is not at code, trying the entry point", arg_type="WARNING")
+
+    l_entry_point: int = input_file.entry_point
+    if l_entry_point != _ida_idaapi.BADADDR and is_code(l_entry_point, arg_debug=arg_debug):
+        log_print(f"Using the entry point 0x{l_entry_point:x}", arg_debug)
+        return l_entry_point
+
+    for l_function_ea in _idautils.Functions(): # Only the first one with code is needed, so not functions() that builds the whole list
+        log_print(f"Trying function 0x{l_function_ea:x}", arg_debug)
+        if is_code(l_function_ea, arg_debug=arg_debug): return l_function_ea
+    return None
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _test_instruction(arg_debug: bool = False) -> bool:
+    ''' Test to decode bytes into an instruction. Works with and without a debugger, see _test_code_address() '''
+    l_code_ea: Optional[int] = _test_code_address(arg_debug=arg_debug)
+    if l_code_ea is None:
+        log_print("No code in the IDB to test on", arg_type="ERROR")
+        return False
+
+    l_ins = instruction(l_code_ea, arg_debug=arg_debug)
     if l_ins is None:
-        log_print("RIP is not at any instruction", arg_type="ERROR")
+        log_print(f"instruction(0x{l_code_ea:x}) failed", arg_type="ERROR")
         return False
     log_print(str(l_ins), arg_debug)
     l_next_ins = l_ins.next_instruction
     if l_next_ins is None:
-        log_print("RIP is not at any instruction", arg_type="ERROR")
+        log_print(f"0x{l_code_ea:x}: next_instruction failed", arg_type="ERROR")
         return False
 
     log_print(str(l_next_ins), arg_debug)
     l_first_instruction_again = l_next_ins.previous_instruction
     if l_first_instruction_again is None:
-        log_print("RIP is not at any instruction", arg_type="ERROR")
+        log_print(f"0x{l_next_ins.ea:x}: previous_instruction failed", arg_type="ERROR")
         return False
 
     log_print(str(l_first_instruction_again), arg_debug)
     res = _test_check("previous_instruction of next_instruction is the first instruction", str(l_ins) == str(l_first_instruction_again), str(l_first_instruction_again), arg_debug)
     res &= _test_check("next_instruction is the instruction directly after (also after a 1 byte instruction)", l_next_ins.ea == l_ins.ea + l_ins.size, f"0x{l_next_ins.ea:x}, expected 0x{l_ins.ea + l_ins.size:x}", arg_debug)
 
-    # A 1 byte instruction: instruction_after() used to skip the instruction after it. Search this function for one
-    l_function = function(l_ins.ea, arg_debug=arg_debug)
-    if l_function is not None:
+    # A 1 byte instruction (ret, push rbx ...): instruction_after() used to skip the instruction after it. Almost every function has one, search until one is found
+    l_found_small: bool = False
+    for l_function_ea in _idautils.Functions():
+        l_function = function(l_function_ea, arg_debug=arg_debug)
+        if l_function is None: continue
         for l_ea in l_function.code_items():
+            log_print(f"Looking for a 1 byte instruction at 0x{l_ea:x}", arg_debug) # Also checks if the user wants to abort
             l_small_ins = instruction(l_ea, arg_debug=arg_debug)
-            if l_small_ins is None or l_small_ins.size != 1 or l_ea + 1 >= l_function.end_ea:
-                continue
+            if l_small_ins is None or l_small_ins.size != 1 or l_ea + 1 >= l_function.end_ea: continue
             l_after = instruction_after(l_ea, arg_debug=arg_debug)
             res &= _test_check("instruction_after() a 1 byte instruction", l_after is not None and l_after.ea == l_ea + 1, f"0x{l_after.ea:x}, expected 0x{l_ea + 1:x}" if l_after is not None else None, arg_debug)
+            l_found_small = True
             break
+        if l_found_small: break
+    if not l_found_small: log_print("No 1 byte instruction found that is followed by more code in the same function, that check was skipped", arg_type="WARNING")
     return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
@@ -7611,9 +7791,10 @@ def _test_bug_report(arg_debug: bool = False) -> bool:
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_ida_is_running_in_batch_mode(arg_debug: bool = False) -> bool:
-    ''' Test if reading from the cvar works '''
-    res = not ida_is_running_in_batch_mode()
-    return res
+    ''' Test if reading from the cvar works. The expected answer depends on how IDA was started, see ida_is_running_in_batch_mode() '''
+    l_expected: bool = _G_IS_IDA_LIBRARY or "-A" in ida_arguments() # idalib/ida_domain and "ida.exe -A" are batch mode, the normal GUI is not
+    l_got: bool = ida_is_running_in_batch_mode()
+    return _test_check(f"ida_is_running_in_batch_mode() == {l_expected} (idalib: {_G_IS_IDA_LIBRARY}, arguments: {ida_arguments()})", l_got == l_expected, l_got, arg_debug)
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_notepad_text(arg_debug: bool = False) -> bool:
@@ -7939,6 +8120,52 @@ def _test_check(arg_name: str, arg_ok: bool, arg_got: Any, arg_debug: bool = Fal
     log_print(f"{arg_name}: {arg_ok} (got {_hex_str_if_int(arg_got)})", arg_debug)
     log_print(f"<<< FAILED >>> {arg_name}: got {_hex_str_if_int(arg_got)}", arg_actually_print=not arg_ok, arg_type="ERROR")
     return arg_ok
+
+@validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
+def _test_fast_execution(arg_debug: bool = False) -> bool:
+    ''' Tests: fast_execution() turns the pydantic validation off and on at runtime (swaps globals, aliases, methods and patched IDA classes), and the state is restored afterwards. '''
+    from pydantic import ValidationError
+    l_old_state: bool = _G_FAST_EXECUTION
+    res = True
+    try:
+        fast_execution(False)
+        try:
+            _hex_str_if_int(0x10, arg_debug="not a bool") # type: ignore[arg-type] # Wrong type on purpose
+            l_raised = False
+        except ValidationError:
+            l_raised = True
+        res &= _test_check("fast_execution(False) --> wrong argument type raises ValidationError", l_raised, l_raised, arg_debug)
+
+        fast_execution(True)
+        res &= _test_check("fast_execution(True) sets _G_FAST_EXECUTION", _G_FAST_EXECUTION is True, _G_FAST_EXECUTION, arg_debug)
+        try:
+            l_got = _hex_str_if_int(0x10, arg_debug="not a bool") # type: ignore[arg-type] # No validation, the raw function runs
+            l_raised = False
+        except ValidationError:
+            l_got = "ValidationError"
+            l_raised = True
+        res &= _test_check("fast_execution(True) --> wrong argument type is not validated", not l_raised and l_got == "0x10 (16)", l_got, arg_debug) # 0x10 is never mapped, so arg_debug is never used
+        res &= _test_check("fast_execution(True) --> the global is the raw function", _hex_str_if_int in _g_raw_to_validated, _hex_str_if_int, arg_debug)
+        res &= _test_check("fast_execution(True) --> alias here is swapped too", here is current_address and current_address in _g_raw_to_validated, here, arg_debug)
+        res &= _test_check("fast_execution(True) --> method in a class of this file is swapped", ColoredFormatter.__dict__["format"] in _g_raw_to_validated, ColoredFormatter.__dict__["format"], arg_debug)
+        res &= _test_check("fast_execution(True) --> function kept by an object of this file is swapped", _g_dual_handler._ida_sender is _send_text_to_ida_output and _send_text_to_ida_output in _g_raw_to_validated, _g_dual_handler._ida_sender, arg_debug)
+        if not _is_running_as_plugin(): # _patch_ida_class() does nothing in the plugin copy
+            res &= _test_check("fast_execution(True) --> property patched on insn_t is swapped", _ida_ua.insn_t.__dict__["instruction_after"].fget is instruction_after, _ida_ua.insn_t.__dict__["instruction_after"].fget, arg_debug)
+        fast_execution(False)
+        res &= _test_check("fast_execution(False) --> the global is the validated function again", _hex_str_if_int in _g_validated_to_raw and here is current_address, _hex_str_if_int, arg_debug)
+        if not _is_running_as_plugin():
+            res &= _test_check("fast_execution(False) --> property patched on insn_t is validated again", _ida_ua.insn_t.__dict__["instruction_after"].fget is instruction_after and instruction_after in _g_validated_to_raw, _ida_ua.insn_t.__dict__["instruction_after"].fget, arg_debug)
+        res &= _test_check("validate_call() keeps the name and docstring", _hex_str_if_int.__name__ == "_hex_str_if_int" and bool(_hex_str_if_int.__doc__), _hex_str_if_int.__name__, arg_debug)
+    finally:
+        fast_execution(l_old_state)
+    res &= _test_check("fast_execution() state restored", _G_FAST_EXECUTION == l_old_state, _G_FAST_EXECUTION, arg_debug)
+    try:
+        fast_execution() # type: ignore[call-arg] # Without an argument on purpose
+        l_raised = False
+    except TypeError:
+        l_raised = True
+    res &= _test_check("fast_execution() without an argument raises TypeError (must not look like it turned it on)", l_raised and _G_FAST_EXECUTION == l_old_state, l_raised, arg_debug)
+    return res
 
 @validate_call(config={"arbitrary_types_allowed": True, "strict": True, "validate_return": True})
 def _test_hex_parse(arg_debug: bool = False) -> bool:
@@ -8279,7 +8506,9 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
     ''' Tests all tests we have so far. This is NOT complete and needs to be extended.
     Every time I have to fix something in an update, I add a test for that.
 
-    To make the tests work:
+    Most tests only need an IDB of notepad.exe (64-bit), also headless (idalib/ida_domain).
+    The tests that need a debugged process or the GUI are SKIPPED when that is missing (see l_tests_needing_debugger and l_tests_needing_qt).
+    To run ALL tests:
     1. You need to be on Windows
     2. Open notepad.exe
     3. Set at breakpoint at the WinMain
@@ -8338,6 +8567,7 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
                         '_test_segment_permissions': _test_segment_permissions,
                         '_test_dump_to_disk_uses_arguments': _test_dump_to_disk_uses_arguments,
                         '_test_decompile_many': _test_decompile_many,
+                        '_test_fast_execution': _test_fast_execution,
                         '_test_hex_parse': _test_hex_parse,
                         '_test_int_to_str_dict_from_module': _test_int_to_str_dict_from_module,
                         '_test_demangle_string': _test_demangle_string,
@@ -8354,9 +8584,26 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
                         '_test_debugger_registers_modules_breakpoints': _test_debugger_registers_modules_breakpoints
                         }
 
-    l_test_result = {}
+    # These tests need a debugged process (notepad.exe stopped at WinMain) or IDA's GUI. When that is missing they are SKIPPED (a WARNING), not failed,
+    # so all the other tests can run headless (idalib/ida_domain) or in the GUI without the debugger
+    l_tests_needing_debugger: Set[str] = {'_test_appcall_on_Windows', '_test_mem_alloc_write_read', '_test_modules_on_Windows', '_test_convert_to_usercall',
+                                          '_test_GetProcAddress_on_Windows', '_test_debugger_registers_modules_breakpoints',
+                                          # These write bytes, and that is only done in _test_scratch_memory() (memory in the debugged process), never in the IDB
+                                          '_test_operand_parser_x64', '_test_instruction_is_same_as_nop', '_test_pointer_write', '_test_segment_permissions',
+                                          '_test_instruction_properties_x64', '_test_make_data_and_set_type', '_test_bytes_smart_delete'}
+    l_tests_needing_qt: Set[str] = {'_test_TWidget', '_test_Qt_stuff'}
+    l_has_debugger: bool = debugger_is_active() and bool(process_is_suspended())
+    if not l_has_debugger: log_print(f"No suspended debugged process, skipping {len(l_tests_needing_debugger & set(l_test_functions))} tests that need one", arg_type="WARNING")
+    if not _G_QT_IS_AVAILABLE: log_print(f"No Qt (headless), skipping {len(l_tests_needing_qt & set(l_test_functions))} tests that need it", arg_type="WARNING")
+
+    l_test_result: Dict[str, bool] = {}
+    l_skipped: List[str] = []
 
     for l_test_name, l_test_func in l_test_functions.items():
+        if (l_test_name in l_tests_needing_debugger and not l_has_debugger) or (l_test_name in l_tests_needing_qt and not _G_QT_IS_AVAILABLE):
+            log_print(f"Skipping test: {l_test_name}", arg_debug) # Also checks if the user wants to abort
+            l_skipped.append(l_test_name)
+            continue
         if arg_slow_mode:
             log_print(f"Running test: {l_test_name}", arg_type="INFO") # Print before running so we know which test is currently executing if it crashes
             for l_handler in _g_logger.handlers:
@@ -8383,6 +8630,7 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
     log_print(f"Decompiler version: {_ida_hexrays.get_hexrays_version()}", arg_type="INFO")
     log_print(f"Community_base version: {__version__}", arg_type="INFO")
     log_print(f"Python version: {_sys.version}", arg_type="INFO")
+    log_print(f"Fast execution (no validation): {_G_FAST_EXECUTION}", arg_type="WARNING" if _G_FAST_EXECUTION else "INFO") # The tests do not check the types when this is on
     log_print(f"OS: {_platform.uname().system} {_platform.uname().version} {_platform.uname().machine}", arg_type="INFO")
     log_print(f"Timestamp: {_timestamped_line('').strip()}", arg_type="INFO")
     
@@ -8391,12 +8639,15 @@ def _test_all(arg_slow_mode: bool = False, arg_coverage: bool = False, arg_debug
             log_print(f"{l_test_name}: {l_result}", arg_type="INFO")
         else:
             log_print(f"{l_test_name}: {l_result}", arg_type="ERROR")
+    for l_test_name in l_skipped:
+        log_print(f"{l_test_name}: SKIPPED", arg_type="WARNING")
 
     res = all(l_test_result.values())
+    l_skipped_text: str = f" ({len(l_skipped)} skipped, see above)" if l_skipped else ""
     if res:
-        log_print("All tests passed OK!", arg_type="INFO")
+        log_print(f"All {len(l_test_result)} tests that ran passed OK!{l_skipped_text}", arg_type="INFO")
     else:
-        log_print("Some tests failed!", arg_type="ERROR")
+        log_print(f"Some tests failed!{l_skipped_text}", arg_type="ERROR")
 
     if arg_coverage:
         cov.stop()

@@ -24,6 +24,7 @@ I try to have a low cognitive load. "What matters is the amount of confusion dev
 import community_base; print("\n".join([wrapper.replace("_idaapi_","") for wrapper in dir(community_base) if wrapper.startswith("_idaapi_")]))
 ```
 - Cancel scripts that take too long. You can copy the the string "abort.ida" into the clipboard and within 10 seconds, the script will stop. Check out ```_check_if_long_running_script_should_abort()``` for implementation
+- Fast execution when your script is done. All the type checks cost time, ```fast_execution(True)``` turns them off at runtime (or set the environment variable COMMUNITY_BASE_FAST_EXECUTION=1 before IDA starts)
 - Easy bug reporting. See the function ```bug_report()```
 - Get some good links to helpful resources. See the function ```links()```
 - when developing, it's nice to have a fast and easy way to reload the script and all it's dependencies, see the function ```reload_python_module()```
